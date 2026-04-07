@@ -49,22 +49,24 @@ def is_substantial_sentence(s: str) -> bool:
     s = s.strip()
     if len(s) < 5:  
         return False
-    if re.match(r'^[^a-zA-Z0-9\u4e00-\u9fff]*$', s):  #only symbol
+    # 检查是否只包含符号（不含字母、数字、中文字符）
+    if re.match(r'^[^\w\u4e00-\u9fff]*$', s):
         return False
     # filter
     words = s.lower().strip('.!?').split()
-    if len(words) <= 2 and words[0] in ['but', 'and', 'so', 'or', 'basically']:
+    if (len(words) <= 2 and words[0] in ['but', 'and', 'so', 'or', 'basically']) or (len(s) <= 10 and re.match(r'^(但是|而且|所以|或者|基本上|然后|接着|因此|于是|不过)', s)):
         return False
     return True
 
 def split_into_sentences(text: str):
-    
-    parts = re.split(r'([.!?。!?]+)(?=\s+[A-Z]|\s*$)', text)
-    
+    # support both Chinese and English punctuation as sentence delimiters
+    parts = re.split(r'([。！？.!?]+)', text)
+
     sentences = []
     i = 0
     while i < len(parts):
-        if i + 1 < len(parts) and re.match(r'^[.!?。!?]+$', parts[i + 1]):
+        # 组合句子和标点
+        if i + 1 < len(parts) and re.match(r'^[。！？.!?]+$', parts[i + 1]):
             sentence = (parts[i] + parts[i + 1]).strip()
             i += 2
         else:
@@ -143,40 +145,44 @@ def cleanup_file(filename: str):
         while i < len(lines):
             current_line = lines[i].strip()
             
-            if '[UPDATED]' in current_line:
-                updated_group = [current_line]
-                j = i + 1
+            # 检测不带 UPDATED 的基础句子，其后续是否有相似的 [UPDATED] 句子
+            if '[UPDATED]' not in current_line and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
                 
-                while j < len(lines):
-                    next_line = lines[j].strip()
-                    if '[UPDATED]' in next_line:
-                        prev_content = updated_group[-1].replace('[UPDATED]', '').strip()
-                        next_content = next_line.replace('[UPDATED]', '').strip()
-                        
-                        if similarity_ratio(prev_content, next_content) >= 0.80:
-                            updated_group.append(next_line)
-                            j += 1
-                        else:
-                            break
-                    else:
-                        break
-                
-                if len(updated_group) >= 1:
-                    if cleaned_lines:
-                        last_saved = cleaned_lines[-1].strip()
-                        first_updated = updated_group[0].replace('[UPDATED]', '').strip()
-                        
-                        if similarity_ratio(last_saved, first_updated) >= 0.80:
-                            cleaned_lines.pop()
+                # 如果下一行带 UPDATED，检查相似性
+                if '[UPDATED]' in next_line:
+                    base_content = current_line.replace('[UPDATED]', '').strip()
+                    next_content = next_line.replace('[UPDATED]', '').strip()
                     
-                    final_sentence = updated_group[-1].replace('[UPDATED]', '').strip()
-                    cleaned_lines.append(final_sentence + '\n')
-                
-                
-                i = j
-            else:
-                cleaned_lines.append(lines[i])
-                i += 1
+                    if similarity_ratio(base_content, next_content) >= 0.80:
+                        # 找到重复模块，j 从 i+1 开始，寻找最后一个相似的 [UPDATED] 句子
+                        j = i + 1
+                        
+                        while j + 1 < len(lines):
+                            current_updated = lines[j].strip()
+                            next_candidate = lines[j + 1].strip()
+                            
+                            if '[UPDATED]' in next_candidate:
+                                current_content = current_updated.replace('[UPDATED]', '').strip()
+                                next_candidate_content = next_candidate.replace('[UPDATED]', '').strip()
+                                
+                                if similarity_ratio(current_content, next_candidate_content) >= 0.80:
+                                    j += 1
+                                else:
+                                    break
+                            else:
+                                break
+                        
+                        # 现在 j 指向最后一个相似的 [UPDATED] 句子
+                        # 删除 i 到 j-1，保留 j 的内容（去掉 UPDATED 标记）
+                        final_sentence = lines[j].strip().replace('[UPDATED]', '').strip()
+                        cleaned_lines.append(final_sentence + '\n')
+                        i = j + 1
+                        continue
+            
+            # 普通句子直接添加
+            cleaned_lines.append(lines[i])
+            i += 1
         
         with open(filename, 'w', encoding='utf-8') as f:
             f.writelines(cleaned_lines)
@@ -205,6 +211,7 @@ async def hook(filename, exit_event):
             searchDepth=1,
             ClassName="LiveCaptionsDesktopWindow"
         )
+        await asyncio.sleep(1)  # Wait for the window not to be empty
         captions_scrollviewer = captions_window.Control(
             searchDepth=5,
             AutomationId="CaptionsScrollViewer",
@@ -218,7 +225,7 @@ async def hook(filename, exit_event):
             current_text = captions_scrollviewer.Name.strip()
 
             if not current_text:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.5)  
                 continue
 
             sentences = split_into_sentences(current_text)
@@ -258,7 +265,7 @@ async def hook(filename, exit_event):
             
             last_full_text = current_text
 
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.25) # Adjust the sleep time as needed
 
         for sentence, count in current_sentences.items():
             similar_index, _ = find_and_replace_similar(sentence)

@@ -5,10 +5,31 @@ import tkinter as tk
 from tkinter import filedialog
 import time
 import aiofiles
+from difflib import SequenceMatcher
+import re
+from .transformation import word_to_number
 
-file_handle = None 
-saved_captions = set()
+file_handle=None
+saved_captions = []  # list of (time, caption)
 save_dir = ""
+
+def normalize_sentence(s: str) -> str:
+    s = s.strip()
+    # space
+    s = re.sub(r'\s+', ' ', s)
+    # lower letter
+    s = s.lower()
+    # "twenty twenty six" -> "2026"
+    s = word_to_number(s)
+    # symbol
+    s = re.sub(r'\s+([.,!?])', r'\1', s)
+    return s
+
+def similarity_ratio(s1: str, s2: str) -> float:
+    """calculate the similarity"""
+    norm1 = normalize_sentence(s1)
+    norm2 = normalize_sentence(s2)
+    return SequenceMatcher(None, norm1, norm2).ratio()
 
 def choose_save_dir():
     global save_dir
@@ -33,18 +54,30 @@ def choose_save_dir():
     return filename
 
 async def save_txt(filename, caption):
-    global file_handle
-       
+    global saved_captions, file_handle
     if file_handle is None:
         file_handle = await aiofiles.open(filename, "a+", encoding="utf-8")
-    
+       
     crt_time = time.time()
-    crt_time_formatted = time.strftime("%H:%M:%S", time.localtime(crt_time))
     
-    if caption not in saved_captions:
-        await file_handle.write(f"[{crt_time_formatted}] {caption}\n")
-        await file_handle.flush()
-        saved_captions.add(caption)
+    if '[UPDATED]' in caption:
+        new_caption = caption.replace('[UPDATED]', '').strip()
+        # find similar, replace
+        for i, (t, saved) in enumerate(saved_captions):
+            if similarity_ratio(new_caption, saved) >= 0.85:
+                saved_captions[i] = (crt_time, new_caption)
+                break
+        else:
+            saved_captions.append((crt_time, new_caption))
+    else:
+        if not any(similarity_ratio(caption, saved) >= 0.85 for _, saved in saved_captions):
+            saved_captions.append((crt_time, caption))
+    
+    # write file
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        for t, cap in saved_captions:
+            t_formatted = time.strftime("%H:%M:%S", time.localtime(t))
+            await f.write(f"[{t_formatted}] {cap}\n")
     
 async def close_file():
     global file_handle
