@@ -10,7 +10,7 @@ import re
 from .transformation import word_to_number
 
 file_handle=None
-saved_captions = []  # list of (time, caption)
+saved_captions: list[tuple[float, str]] = []
 save_dir = ""
 
 def normalize_sentence(s: str) -> str:
