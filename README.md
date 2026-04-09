@@ -1,7 +1,14 @@
 # Save Live Captions
 
-**Tired of losing live captions on Windows?**  This is a simple tool to save the content of live captions! 
+**Tired of losing live captions on Windows?**  This is a simple tool to save the content of live captions! The saved text document is like following:
+><img width="1187" height="477" alt="image" src="https://github.com/user-attachments/assets/78f3a0df-80f3-4e40-bc0e-9137910352c6" />
 
+###  Features
+
+---
+- ✨Save live captions to a text file.
+- 😃Minimalist floating dashboard.
+- **😎Customizable save options. (save location and quality option in `config.py`)**
 
 ###  Installation
 ### Option 1: Quick Start (Executable)
@@ -25,14 +32,7 @@ If you prefer to run the code directly, follow these steps in your bash/PowerShe
    ```bash
    python src/main.py
    ```
-
-###  Features
-
----
-
-- Save live captions to a text file.
-- Minimalist floating dashboard.
-- Customizable save location.
+   > **Good News, You can now edit the `src/function/config.py` to modify the quality of saving on your own.**
 
 ### Guidelines
 
