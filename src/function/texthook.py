@@ -33,7 +33,7 @@ def split_into_sentences(text: str)-> list[str]:
     text = re.sub(r'\s+', ' ', text).strip()
 
     # -- Add email / url protection here if needed --
-    placeholders = {}
+    placeholders: Dict[str, Any] = {}
     def protect(pattern, repl_prefix):
         nonlocal text
         def replacer(m):
