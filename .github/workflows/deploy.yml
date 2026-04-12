@@ -38,6 +38,9 @@ jobs:
       run: |
         # Onefile
         pyinstaller --clean --onefile --windowed --icon=assets/SaveLC.ico --name SaveLiveCaptions_SingleFile src/main.py
+
+        # Onefile with Live Captions auto start
+        pyinstaller --clean --onefile --windowed --icon=assets/SaveLC.ico --name SaveLiveCaptions_LCautostart SaveLiveCaptionsWithLC.py
         
         # Onedir
         pyinstaller --clean --onedir --windowed --icon=assets/SaveLC.ico --name SaveLiveCaptions_Folder src/main.py  
@@ -69,6 +72,7 @@ jobs:
         files: |
           dist/SaveLiveCaptions_SingleFile.exe
           dist/SaveLiveCaptions_Setup.exe
+          dist/SaveLiveCaptions_LCautostart.exe
         tag_name: ${{ github.ref_name }}  
         name: Release ${{ github.ref_name }}
         body: |
