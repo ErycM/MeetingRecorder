@@ -3,7 +3,7 @@
 #define MyAppVersion "1.2.0"
 #define MyAppPublisher "LiveCaptionsHelper"
 #define MyAppURL "https://github.com/LiveCaptionsHelper/SaveLiveCaptions"
-#define MyAppExeName "SaveLiveCaptions_Folder.exe"
+#define MyAppExeName "SaveLiveCaptions_LCautostart_Folder.exe"
 
 [Setup]
 AppId={{696FDCA2-CFAF-49EE-B803-EAE6FA86BA2D}
