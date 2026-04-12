@@ -14,14 +14,7 @@ src_path = os.path.join(root_path, 'src')
 if src_path not in sys.path:
     sys.path.append(src_path)
 
-try:
-    import main
-except ModuleNotFoundError:
-    # import main.py directly if not found in sys.path (for development)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("main", os.path.join(base_path, "src", "main.py"))
-    main = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(main)
+import main
 
 # Launch with “Win + Ctrl + L”
 def launch_lc():
