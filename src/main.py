@@ -77,7 +77,10 @@ def dashboard(loop):
     window.after(10, poll_loop)
     window.mainloop()
 
-if __name__ == "__main__":
+def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     dashboard(loop)
+
+if __name__ == "__main__":
+    main()

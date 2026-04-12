@@ -1,9 +1,9 @@
 
-#define MyAppName "Save Live Captions"
-#define MyAppVersion "1.1.1"
+#define MyAppName "Save Live Captions(LC autostart)"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "LiveCaptionsHelper"
 #define MyAppURL "https://github.com/LiveCaptionsHelper/SaveLiveCaptions"
-#define MyAppExeName "SaveLiveCaptions_Folder.exe"
+#define MyAppExeName "SaveLiveCaptions_LCautostart_Folder.exe"
 
 [Setup]
 AppId={{696FDCA2-CFAF-49EE-B803-EAE6FA86BA2D}
@@ -31,9 +31,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; pack dist\SaveLiveCaptions_Folder 
-Source: "dist\SaveLiveCaptions_Folder\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\SaveLiveCaptions_Folder\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; pack dist\SaveLiveCaptions_LCautostart_Folder 
+Source: "dist\SaveLiveCaptions_LCautostart_Folder\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\SaveLiveCaptions_LCautostart_Folder\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
