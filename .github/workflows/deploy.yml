@@ -52,6 +52,7 @@ jobs:
         path: |
           dist/SaveLiveCaptions_SingleFile.exe
           dist/SaveLiveCaptions_Folder/
+          dist/SaveLiveCaptions_LCautostart.exe
         retention-days: 7  
     
     - name: Compile Inno Setup Script
