@@ -42,16 +42,20 @@ jobs:
         # Onefile with Live Captions auto start
         pyinstaller --clean --onefile --windowed --icon=assets/SaveLC.ico --name SaveLiveCaptions_LCautostart SaveLiveCaptionsWithLC.py
         
-
+        # Onedir
+        #pyinstaller --clean --onedir --windowed --icon=assets/SaveLC.ico --name SaveLiveCaptions_Folder src/main.py  
+        
     - name: Upload to Artifacts (for quick testing)
       uses: actions/upload-artifact@v4
       with:
         name: SaveLiveCaptions_Builds
         path: |
           dist/SaveLiveCaptions_SingleFile.exe
+          dist/SaveLiveCaptions_Folder/
           dist/SaveLiveCaptions_LCautostart.exe
         retention-days: 3  
     
+    '''
     - name: Compile Inno Setup Script
       shell: pwsh
       run: |
@@ -63,14 +67,14 @@ jobs:
         name: SaveLiveCaptions_Setup
         path: installer_output/SaveLiveCaptions_Setup.exe
         retention-days: 3
-
+    '''
+    
     - name: Create Release and Upload exe (only on tags)
       if: startsWith(github.ref, 'refs/tags/')  
       uses: softprops/action-gh-release@v2  
       with:
         files: |
           dist/SaveLiveCaptions_SingleFile.exe
-          dist/SaveLiveCaptions_Setup.exe
           dist/SaveLiveCaptions_LCautostart.exe
         tag_name: ${{ github.ref_name }}  
         name: Release ${{ github.ref_name }}
