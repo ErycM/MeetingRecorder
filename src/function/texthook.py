@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import uiautomation as auto
+from typing import Dict, Any
 import time
 from . import save
 from .save import save_replace_txt, save_txt
