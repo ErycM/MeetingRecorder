@@ -2,9 +2,10 @@ import sys
 import os
 import asyncio
 import uiautomation as auto
+from typing import Dict, Any
 import time
 from . import save
-from .save import save_txt
+from .save import save_replace_txt, save_txt
 import re
 
 from function.dedup import Deduplicator
@@ -32,6 +33,20 @@ def split_into_sentences(text: str)-> list[str]:
     # handle space
     text = re.sub(r'\s+', ' ', text).strip()
 
+    # -- Add email / url protection here if needed --
+    placeholders: Dict[str, Any] = {}
+    def protect(pattern, repl_prefix):
+        nonlocal text
+        def replacer(m):
+            key = f"__{repl_prefix}{len(placeholders)}__"
+            placeholders[key] = m.group(0)
+            return key
+        text = re.sub(pattern, replacer, text)
+    
+    protect(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', 'EMAIL')
+    protect(r'https?://[^\s]+', 'URL')
+    protect(r'\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', 'DOMAIN')  # economist.com 
+
     # safe split, avoid splitting numbers like "3.14" or "2023.09.01" or "Ms. Menro"
     # specialized for Chinese, the live captions usually use "，" to separate long sentences without punctuation, so we can split by "，" if the sentence is too long and contains "，"
     chinese_punctuation = r'([，。！；？.;!?]+(?![0-9]))|((?<![A-Za-z0-9\w])\.(?![A-Za-z0-9]))'
@@ -51,6 +66,8 @@ def split_into_sentences(text: str)-> list[str]:
         if is_chinese:
             if re.search(chinese_punctuation, current):
                 sentence = current.strip()
+                for k, v in placeholders.items():
+                    sentence = sentence.replace(k, v)
                 if deduper.is_substantial_sentence(sentence):
                     sentences.append(sentence)
                 current = ""      
@@ -58,6 +75,8 @@ def split_into_sentences(text: str)-> list[str]:
             # -- for non-Chinese, split by punctuation --
             if re.search(general_punctuation, current):
                 sentence = current.strip()
+                for k, v in placeholders.items():
+                    sentence = sentence.replace(k, v)
                 if deduper.is_substantial_sentence(sentence):
                     sentences.append(sentence)
                 current = ""
@@ -78,6 +97,8 @@ def find_and_replace_similar(sentence: str, threshold: float = 0.85, max_time_di
     otherwise return False
     """
     current_time = time.time()
+    # for short sentences, use higher threshold to avoid false positive
+    threshold = 0.92 if len(sentence) <= 20 else threshold  
     for i, (saved_time, saved_text) in enumerate(save.saved_captions):
         if deduper.similarity_ratio(sentence, saved_text) >= threshold:
             # if in time window, consider replacing if it's a better version
@@ -175,26 +196,22 @@ async def hook(filename, exit_event):
             current_frame_sentences = set(sentences)
 
             new_current_sentences = {}
-            has_complete_sentence = False
             
             for sentence in current_frame_sentences:
                 # filter incomplete sentence
                 if is_incomplete_sentence(sentence):
                     continue
 
-                has_complete_sentence = True
                 similar_index, should_replace = find_and_replace_similar(sentence)
                 
                 if similar_index is not None:
                     if should_replace:
-                        old_time,old_sentence = save.saved_captions[similar_index]
+                        old=save.saved_captions[similar_index]
+                        old_time,old_sentence = old
                         save.saved_captions[similar_index] = (old_time, sentence)
                         seen_sentences.discard(old_sentence)  # remove old sentence from seen set
                         seen_sentences.add(sentence)  # add new sentence to seen set
-                        print(f"[REPLACE]")
-                        print(f"  OLD: {old_sentence}")
-                        print(f"  NEW: {sentence}")
-                        await save_txt(filename,save.saved_captions[similar_index])
+                        await save_replace_txt(filename,old,save.saved_captions[similar_index])
                     continue
                 
                 if sentence in current_sentences:
@@ -258,7 +275,6 @@ async def hook(filename, exit_event):
                     save.saved_captions.append((time.time(), trailing_text))
                     await save_txt(filename,save.saved_captions[-1])
         
-        await save.sort_captions(filename)
         await asyncio.to_thread(deduper.cleanup_file, filename)
         
         print("[EXIT] Done!")

@@ -53,21 +53,25 @@ def choose_save_dir():
     
     return filename
 
-async def sort_captions(filename):
-    def extract_time(line):
-        match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-        if match:
-            time_str = match.group(1)
-            return time.strptime(time_str, "%H:%M:%S")
-        return None
-    with open(filename, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    lines.sort(key=extract_time)
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
+async def save_replace_txt(filename,old_caption: tuple[float, str], new_caption: tuple[float, str]):
+    ''' Replace old caption with new caption '''
+    t_old, cap_old = old_caption
+    _, cap_new = new_caption
+    t_formatted = time.strftime("%H:%M:%S", time.localtime(t_old))
+    
+    # read file and replace line
+    async with aiofiles.open(filename, "r", encoding="utf-8") as f:
+        lines = await f.readlines()
+    
+    for idx, line in enumerate(lines):
+        if t_formatted in line and cap_old in line:
+            lines[idx] = f"[{t_formatted}] {cap_new}\n"
+            print(f"[REPLACE] Replaced:\n  OLD: {cap_old}\n  NEW: {cap_new}")
+            break
+    
+    # write back to file
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        await f.writelines(lines)
 
 async def save_txt(filename,new_caption: tuple[float, str]):
     ''' Add new caption '''

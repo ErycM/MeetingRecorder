@@ -29,6 +29,12 @@ class Deduplicator:
         s = s.strip()
         # space
         s = re.sub(r'\s+', ' ', s)
+        # @email.com -> at email dot com
+        s = re.sub(r'(\w+)@(\w+)\.(\w+)', r'\1 at \2 dot \3', s)
+        # .com .cn -> dot com dot cn dash
+        s = re.sub(r'\.(com|cn|net|org|io|gov)', r' dot \1', s)
+        # @ -> at
+        s = re.sub('@', ' at ', s)
         # lower letter
         s = s.lower()
         # "twenty twenty six" -> "2026"
@@ -151,8 +157,9 @@ class Deduplicator:
                 
                 # subset judgement
                 is_subset = False
-                end_idx = min(idx+3, len(pass1))  # 只看后面3句，避免误删
-                for future_idx in range(idx+1, end_idx):
+                start_idx=max(0, idx-3)  # check the previous 3 sentences for superset
+                end_idx = min(idx+3, len(pass1))  # check the following 3 sentences for subset
+                for future_idx in range(start_idx, end_idx):
                     future_line = pass1[future_idx]
                     _, future_sentence = extract(future_line)
                     if len(sentence) >= len(future_sentence):
@@ -164,10 +171,12 @@ class Deduplicator:
                     
                     if len(clean_sent) == 0: # empty after stripping, skip subset check and let it be removed by non-substantial filter
                         continue 
-
+                    # prefix check
                     prefix_len = self.longest_common_prefix(clean_sent, clean_future)
-                    if prefix_len / len(clean_sent) >= 0.95:
-                        # if the longest common prefix covers most of the shorter sentence, consider it a subset
+                    is_prefix = prefix_len / len(clean_sent) >= 0.95
+                    # suffix check
+                    is_suffix = clean_future.endswith(clean_sent) or clean_sent in clean_future
+                    if is_prefix or is_suffix:
                         is_subset = True
                         print(f"[CLEANUP-P2] Removed subset: '{sentence}' is subset of '{future_sentence}'")
                         break
@@ -182,7 +191,7 @@ class Deduplicator:
                 is_dup = False
                 for idx, kept_line in enumerate(pass3):
                     _, kept_sentence = extract(kept_line)
-                    if self.similarity_ratio(sentence, kept_sentence) >= 0.96:
+                    if self.similarity_ratio(sentence, kept_sentence) >= 0.92:
                         if self.is_better_version(sentence, kept_sentence):
                             pass3[idx] = line  
                             print(f"[CLEANUP-P3] Replaced:\n  OLD: {kept_sentence}\n  NEW: {sentence}")
