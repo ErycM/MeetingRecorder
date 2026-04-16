@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw
 from mic_monitor import MicMonitor
 from audio_recorder import DualAudioRecorder
 from transcriber import LemonadeTranscriber
+from stream_transcriber import StreamTranscriber
 from widget import RecorderWidget
 
 # Save directories — Obsidian vault
@@ -53,6 +54,7 @@ class MeetingRecorder:
         self.tray = None
         self.recorder = DualAudioRecorder()
         self.transcriber = LemonadeTranscriber()
+        self.stream_transcriber = None
         self._current_wav = None
         self._recording_start_time = None
 
@@ -174,7 +176,7 @@ class MeetingRecorder:
         return os.path.join(SAVE_DIR, f"{timestamp}_transcript.md")
 
     def _start_recording(self):
-        """Start audio recording."""
+        """Start audio recording + real-time streaming transcription."""
         self._current_wav = self._new_wav_path()
         self._recording_start_time = time.time()
 
@@ -183,10 +185,29 @@ class MeetingRecorder:
             self.widget.set_recording(True)
             self._update_tray_icon()
             self._start_silence_checker()
+            self._start_streaming()
             log.info(f"[RECORDER] Recording started → {self._current_wav}")
         except Exception as e:
             log.error(f"[RECORDER] Failed to start recording: {e}")
             self.widget.set_recording(False)
+
+    def _on_stream_text(self, text: str):
+        """Callback from StreamTranscriber — dispatch caption to UI thread."""
+        self.widget.window.after(0, lambda: self.widget.append_caption(text))
+
+    def _start_streaming(self):
+        """Start real-time streaming transcription alongside recording."""
+        try:
+            self.stream_transcriber = StreamTranscriber(
+                on_text=self._on_stream_text,
+            )
+            self.stream_transcriber.start()
+            self.recorder.set_audio_chunk_callback(self.stream_transcriber.send_audio)
+            log.info("[RECORDER] Streaming transcription started")
+        except Exception as e:
+            log.warning(f"[RECORDER] Streaming failed to start, will use batch: {e}")
+            self.stream_transcriber = None
+            self.recorder.set_audio_chunk_callback(None)
 
     def _start_silence_checker(self):
         """Start periodic check for audio silence."""
@@ -207,29 +228,67 @@ class MeetingRecorder:
         self.widget.window.after(SILENCE_CHECK_INTERVAL, self._check_silence)
 
     def _stop_and_transcribe(self):
-        """Stop recording and transcribe in a background thread."""
+        """Stop recording. Use streaming transcript if available, else batch."""
         if not self.recorder.is_recording:
             return
 
+        # Stop audio chunk callback first
+        self.recorder.set_audio_chunk_callback(None)
         self.recorder.stop()
         self.widget.set_recording(False)
         self._update_tray_icon()
-        self.widget.set_status("Transcribing...")
 
         duration = time.time() - self._recording_start_time if self._recording_start_time else 0
         wav_path = self._current_wav
 
-        log.info(f"[RECORDER] Recording stopped ({duration:.0f}s). Transcribing...")
+        # Collect streaming transcript
+        stream_text = ""
+        if self.stream_transcriber:
+            stream_text = self.stream_transcriber.stop()
+            self.stream_transcriber = None
 
-        # Transcribe in background thread to avoid blocking UI
-        threading.Thread(
-            target=self._transcribe_worker,
-            args=(wav_path, duration),
-            daemon=True,
-        ).start()
+        log.info(f"[RECORDER] Recording stopped ({duration:.0f}s). Stream text: {len(stream_text)} chars")
+
+        if stream_text and len(stream_text.strip()) >= 10:
+            # Use streaming transcript — save instantly, no batch needed
+            self.widget.set_status("Saving transcript...")
+            threading.Thread(
+                target=self._save_stream_transcript,
+                args=(wav_path, stream_text, duration),
+                daemon=True,
+            ).start()
+        else:
+            # Fallback to batch transcription
+            self.widget.set_status("Transcribing (batch)...")
+            log.info("[RECORDER] Streaming transcript empty, falling back to batch")
+            threading.Thread(
+                target=self._transcribe_worker,
+                args=(wav_path, duration),
+                daemon=True,
+            ).start()
+
+    def _save_stream_transcript(self, wav_path: str, text: str, duration: float):
+        """Save streaming transcript directly — no batch re-transcription needed."""
+        try:
+            output_path = self._new_transcript_path()
+            self.transcriber.save_transcript(
+                text, output_path, duration_seconds=duration
+            )
+            self._archive_wav(wav_path, output_path)
+
+            self.widget.window.after(0, lambda: self.widget.set_status(
+                f"Saved: {os.path.basename(output_path)}"
+            ))
+            log.info(f"[RECORDER] Stream transcript saved → {output_path}")
+
+        except Exception as e:
+            log.error(f"[RECORDER] Failed to save stream transcript: {e}")
+            # Fallback to batch
+            log.info("[RECORDER] Falling back to batch transcription")
+            self._transcribe_worker(wav_path, duration)
 
     def _transcribe_worker(self, wav_path: str, duration: float):
-        """Transcribe WAV and save .md. Runs in background thread."""
+        """Transcribe WAV via batch API and save .md. Runs in background thread."""
         try:
             if not os.path.exists(wav_path):
                 log.error(f"[TRANSCRIBE] WAV file not found: {wav_path}")

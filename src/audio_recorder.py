@@ -107,6 +107,12 @@ class DualAudioRecorder:
         self._mic_stream = None
         self._loopback_stream = None
         self._last_audio_time = 0.0  # last time audio was above silence threshold
+        self._on_audio_chunk = None  # callback(pcm_bytes) for streaming
+
+    def set_audio_chunk_callback(self, callback):
+        """Register callback to receive 16kHz mono PCM16 chunks (~100ms each).
+        Used by StreamTranscriber for real-time transcription."""
+        self._on_audio_chunk = callback
 
     def start(self, wav_path: str):
         """Start recording to the given WAV file path."""
@@ -277,7 +283,15 @@ class DualAudioRecorder:
 
                 # Convert to int16 and write
                 pcm = (mixed * 32767).astype(np.int16)
-                wf.writeframes(pcm.tobytes())
+                pcm_bytes = pcm.tobytes()
+                wf.writeframes(pcm_bytes)
+
+                # Stream chunk to real-time transcriber
+                if self._on_audio_chunk:
+                    try:
+                        self._on_audio_chunk(pcm_bytes)
+                    except Exception:
+                        pass
 
                 mic_buffer = mic_buffer[samples_per_cycle:]
                 loopback_buffer = loopback_buffer[samples_per_cycle:]

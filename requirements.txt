@@ -5,6 +5,8 @@ scipy>=1.10
 requests>=2.28
 pystray>=0.19
 Pillow>=9.0
+openai>=1.59
+websockets>=12.0
 
 # Legacy entry point (SaveLiveCaptionsWithLC.py)
 uiautomation>=2.0
