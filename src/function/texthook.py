@@ -169,12 +169,14 @@ async def hook(filename, exit_event):
         if not lc_detect():
             return False
 
+        auto.SetGlobalSearchTimeout(5.0)  # Give enough time for control search
+
         desktop = auto.GetRootControl()
         captions_window = desktop.Control(
             searchDepth=1,
             ClassName="LiveCaptionsDesktopWindow"
         )
-        await asyncio.sleep(1)  # Wait for the window not to be empty
+        await asyncio.sleep(1)
         captions_scrollviewer = captions_window.Control(
             searchDepth=5,
             AutomationId="CaptionsScrollViewer",

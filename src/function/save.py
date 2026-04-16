@@ -46,8 +46,13 @@ def choose_save_dir():
         root.destroy()  
 
         if not save_dir:
-            save_dir = os.path.expanduser("~/Documents/captions")
-            os.makedirs(save_dir, exist_ok=True)
+            # Default to Obsidian vault meeting captures (absolute path)
+            vault_captures = r"C:\Users\erycm\OneDrive\Documentos\personal_obsidian\raw\meetings\captures"
+            if os.path.isdir(vault_captures):
+                save_dir = vault_captures
+            else:
+                save_dir = os.path.expanduser("~/Documents/captions")
+                os.makedirs(save_dir, exist_ok=True)
     
     filename = os.path.join(save_dir, f"{timestamp}_captions.txt")
     
