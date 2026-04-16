@@ -183,6 +183,11 @@ class AppWindow:
         from app.state import AppState
 
         if new is AppState.RECORDING:
+            # Bring the window out of the tray so the user actually sees
+            # that recording has started. Without this the app "silently"
+            # records while hidden, giving the appearance that nothing
+            # happened when the user joined a call.
+            self.show()
             self._tabview.set("Live")
             self._live_tab.clear_captions()
             self._live_tab.set_recording(True)

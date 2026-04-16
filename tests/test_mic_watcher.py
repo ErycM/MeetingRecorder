@@ -388,6 +388,8 @@ class TestMicWatcherLifecycle:
             from app.services.mic_watcher import _is_self
 
             raw = [python_key]
+            if not exclusion:
+                return raw
             return [k for k in raw if not _is_self(k, exclusion)]
 
         watcher = MicWatcher(

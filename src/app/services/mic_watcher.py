@@ -226,6 +226,10 @@ class MicWatcher:
         self._thread: threading.Thread | None = None
         self._mic_is_active = False
         self._last_active_time: float = 0.0
+        # Diagnostic: remember last raw (pre-filter) user set so we only log
+        # on change, not every poll. Helps diagnose "my call app wasn't
+        # detected" without spamming the log file.
+        self._last_raw_users: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
     # Public API
@@ -281,7 +285,30 @@ class MicWatcher:
 
         while self._running:
             try:
-                users = _get_mic_users(_winreg, self._self_exclusion)
+                # Raw users first (pre-filter) so we can diagnose when a call
+                # app is detected but then incorrectly excluded.
+                raw_users = _get_mic_users(_winreg, None)
+                users = [u for u in raw_users if not _is_self(u, self._self_exclusion)]
+
+                # Log every change in the raw set at INFO so the user's log
+                # shows exactly what Windows reports while they test a call.
+                raw_tuple = tuple(sorted(raw_users))
+                if raw_tuple != self._last_raw_users:
+                    self._last_raw_users = raw_tuple
+                    if raw_users:
+                        short = [u.split("#")[-1] if "#" in u else u for u in raw_users]
+                        excluded = [u for u in raw_users if u not in users]
+                        short_excl = [
+                            u.split("#")[-1] if "#" in u else u for u in excluded
+                        ]
+                        log.info(
+                            "[MIC] Registry reports mic in use by: %s (excluded as self: %s)",
+                            short,
+                            short_excl or "none",
+                        )
+                    else:
+                        log.info("[MIC] Registry reports mic idle")
+
                 now = time.time()
 
                 if users:
