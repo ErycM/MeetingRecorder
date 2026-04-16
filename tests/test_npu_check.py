@@ -97,14 +97,39 @@ class TestListNpuModels:
     def test_no_provider_field_falls_back_to_allowlist(self) -> None:
         """When no model has a provider field, allowlist is used."""
         response_data = [
-            {"id": "whisper-medium.en"},  # in allowlist
+            {"id": "Whisper-Large-v3-Turbo"},  # in allowlist
             {"id": "some-unknown-model"},  # NOT in allowlist
         ]
         with patch("requests.get", return_value=_mock_response(response_data)):
             models = list_npu_models(_SERVER_URL)
 
-        assert "whisper-medium.en" in models
+        assert "Whisper-Large-v3-Turbo" in models
         assert "some-unknown-model" not in models
+
+    def test_recipe_whispercpp_with_npu_cache_returned(self) -> None:
+        """Models with recipe='whispercpp' and npu_cache checkpoint are returned."""
+        response_data = [
+            {
+                "id": "Whisper-Large-v3-Turbo",
+                "recipe": "whispercpp",
+                "checkpoints": {"npu_cache": "path/to/cache"},
+            },
+            {
+                "id": "Whisper-No-Cache",
+                "recipe": "whispercpp",
+                "checkpoints": {},
+            },
+            {
+                "id": "gguf-llm",
+                "recipe": "llamacpp",
+            },
+        ]
+        with patch("requests.get", return_value=_mock_response(response_data)):
+            models = list_npu_models(_SERVER_URL)
+
+        assert "Whisper-Large-v3-Turbo" in models
+        assert "Whisper-No-Cache" not in models
+        assert "gguf-llm" not in models
 
     def test_no_provider_field_all_unknown_returns_empty(self) -> None:
         """Models not in allowlist and no provider field → empty result."""
@@ -213,12 +238,12 @@ class TestEnsureReadyEnforced:
 
     def test_fallback_allowlist_model_returns_ready(self) -> None:
         """Model in allowlist (no provider field) → NPUStatus(ready=True)."""
-        data = [{"id": "whisper-medium.en"}]
+        data = [{"id": "Whisper-Large-v3-Turbo"}]
         with patch("requests.get", return_value=_mock_response(data)):
             status = ensure_ready(_SERVER_URL)
 
         assert status.ready is True
-        assert "whisper-medium.en" in status.available_models
+        assert "Whisper-Large-v3-Turbo" in status.available_models
 
     def test_error_message_contains_settings_hint(self) -> None:
         """The NPU-not-available error message hints at Settings → Diagnostics."""
@@ -278,8 +303,8 @@ class TestAllowlist:
     def test_allowlist_contains_expected_models(self) -> None:
         """The hardcoded allowlist contains the production NPU model IDs."""
         assert "Whisper-Large-v3-Turbo" in NPU_ALLOWLIST
-        assert "whisper-medium.en" in NPU_ALLOWLIST
-        assert "whisper-large-v3" in NPU_ALLOWLIST
+        assert "Whisper-Medium" in NPU_ALLOWLIST
+        assert "Whisper-Large-v3" in NPU_ALLOWLIST
 
     def test_allowlist_is_frozenset(self) -> None:
         assert isinstance(NPU_ALLOWLIST, frozenset)

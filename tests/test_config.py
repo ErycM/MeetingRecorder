@@ -38,7 +38,7 @@ class TestConfigDefaults:
 
         assert cfg.vault_dir is None
         assert cfg.wav_dir is None
-        assert cfg.whisper_model == "whisper-medium.en"
+        assert cfg.whisper_model == "Whisper-Large-v3-Turbo"
         assert cfg.silence_timeout == 30
         assert cfg.live_captions_enabled is False
         assert cfg.launch_on_login is False

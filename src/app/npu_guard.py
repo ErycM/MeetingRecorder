@@ -39,18 +39,24 @@ log = logging.getLogger(__name__)
 ENFORCE_NPU: bool = True
 
 # Hardcoded allowlist used when Lemonade's /api/v1/models response has no
-# provider/backend field to filter on.
+# provider/backend field to filter on. Matches the canonical model IDs that
+# Lemonade ships with NPU cache weights on AMD Ryzen AI platforms.
 NPU_ALLOWLIST: frozenset[str] = frozenset(
     {
+        "Whisper-Tiny",
+        "Whisper-Base",
+        "Whisper-Small",
+        "Whisper-Medium",
+        "Whisper-Large-v3",
         "Whisper-Large-v3-Turbo",
-        "whisper-medium.en",
-        "whisper-large-v3",
     }
 )
 
 # Fields we inspect (in priority order) to detect NPU execution provider.
 _NPU_PROVIDER_FIELDS = ("backend", "execution_provider", "provider")
 _NPU_KEYWORD = "npu"
+# Lemonade "recipe" values that run on NPU via whisper.cpp + VitisAI.
+_NPU_WHISPER_RECIPES: frozenset[str] = frozenset({"whispercpp"})
 
 # Default Lemonade REST base URL
 DEFAULT_SERVER_URL = "http://localhost:13305"
@@ -100,7 +106,9 @@ def list_npu_models(server_url: str = DEFAULT_SERVER_URL) -> list[str]:
     requests.RequestException
         On network/HTTP error — let the caller decide how to handle.
     """
-    url = f"{server_url.rstrip('/')}/api/v1/models"
+    # show_all=true surfaces downloadable-but-not-yet-downloaded models so we
+    # can validate the configured model name before a load attempt fails.
+    url = f"{server_url.rstrip('/')}/api/v1/models?show_all=true"
     log.debug("[LEMONADE] GET %s", url)
 
     resp = requests.get(url, timeout=10)
@@ -117,15 +125,28 @@ def list_npu_models(server_url: str = DEFAULT_SERVER_URL) -> list[str]:
 
     log.debug("[LEMONADE] %d model entries returned", len(models))
 
-    # Check if any entry has a provider-type field
+    # Strategy 1: provider/backend/execution_provider fields (older schemas)
     has_provider_field = any(
         any(f in entry for f in _NPU_PROVIDER_FIELDS) for entry in models
     )
-
     if has_provider_field:
-        return _filter_by_provider(models)
-    else:
-        return _filter_by_allowlist(models)
+        result = _filter_by_provider(models)
+        if result:
+            return result
+        # Provider field was present on some entries but none contained "npu" —
+        # fall through to recipe/allowlist strategies so Whisper still surfaces.
+
+    # Strategy 2: recipe field (current Lemonade schema — whispercpp implies NPU
+    # on AMD Ryzen AI builds via VitisAI-compiled encoder weights).
+    has_recipe_field = any("recipe" in entry for entry in models)
+    if has_recipe_field:
+        recipe_matches = _filter_by_recipe(models)
+        if recipe_matches:
+            return recipe_matches
+        # No recipe matches either — fall through to allowlist.
+
+    # Strategy 3: hardcoded allowlist (last resort).
+    return _filter_by_allowlist(models)
 
 
 def ensure_ready(server_url: str = DEFAULT_SERVER_URL) -> NPUStatus:
@@ -184,6 +205,30 @@ def _filter_by_provider(models: list[dict]) -> list[str]:
                 if model_id:
                     result.append(str(model_id))
                 break
+    return result
+
+
+def _filter_by_recipe(models: list[dict]) -> list[str]:
+    """Return Whisper model IDs whose ``recipe`` field indicates NPU execution.
+
+    Lemonade's current schema (2026) uses ``recipe: "whispercpp"`` for Whisper
+    models that compile onto the NPU via VitisAI. We additionally require an
+    ``npu_cache`` checkpoint (if ``checkpoints`` is present) so models without
+    a precompiled NPU cache do not surface — they would run on CPU.
+    """
+    result: list[str] = []
+    for entry in models:
+        recipe = str(entry.get("recipe", "")).lower()
+        if recipe not in _NPU_WHISPER_RECIPES:
+            continue
+        # If the entry exposes a checkpoints map, require an npu_cache key so
+        # we never surface a whisper model that lacks compiled NPU weights.
+        checkpoints = entry.get("checkpoints")
+        if isinstance(checkpoints, dict) and not checkpoints.get("npu_cache"):
+            continue
+        model_id = entry.get("id") or entry.get("name") or entry.get("model")
+        if model_id:
+            result.append(str(model_id))
     return result
 
 

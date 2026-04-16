@@ -43,7 +43,11 @@ CONFIG_PATH: Path = _default_config_path()
 # Default values
 # ---------------------------------------------------------------------------
 
-_DEFAULT_WHISPER_MODEL = "whisper-medium.en"
+# Default Whisper model — must match a canonical model ID that Lemonade
+# ships with NPU cache weights on AMD Ryzen AI platforms. "whisper-medium.en"
+# was an invalid ID on current Lemonade installs (2026) which use capitalised
+# names like "Whisper-Large-v3-Turbo". Must also appear in npu_guard.NPU_ALLOWLIST.
+_DEFAULT_WHISPER_MODEL = "Whisper-Large-v3-Turbo"
 _DEFAULT_SILENCE_TIMEOUT = 30
 _DEFAULT_HOTKEY: str | None = None
 

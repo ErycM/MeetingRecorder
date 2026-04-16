@@ -152,6 +152,32 @@ class TestIsSelf:
         key = "C:#Users#me#AppData#Python312#pythonw.exe"
         assert _is_self(key, "MeetingRecorder.exe") is False
 
+    def test_python_exe_self_exclusion_aliases_pythonw_exe(self):
+        """Source-run case: self_exclusion='python.exe' must alias pythonw.exe.
+
+        When launched via ``python src/main.py`` Windows may register the Tk
+        GUI app under pythonw.exe even though sys.executable resolves to
+        python.exe. Both must self-exclude to avoid the duplicate-launch bug.
+        """
+        from app.services.mic_watcher import _is_self
+
+        key = "C:#Program Files#Python312#pythonw.exe"
+        assert _is_self(key, "python.exe") is True
+
+    def test_pythonw_exe_self_exclusion_aliases_python_exe(self):
+        """Symmetric case — the aliasing must be bidirectional."""
+        from app.services.mic_watcher import _is_self
+
+        key = "C:#Program Files#Python312#python.exe"
+        assert _is_self(key, "pythonw.exe") is True
+
+    def test_python_alias_does_not_leak_into_frozen_exe_match(self):
+        """Frozen MeetingRecorder.exe must NOT be aliased to python.exe."""
+        from app.services.mic_watcher import _is_self
+
+        key = "C:#Program Files#Python312#python.exe"
+        assert _is_self(key, "MeetingRecorder.exe") is False
+
 
 # ---------------------------------------------------------------------------
 # _get_mic_users unit tests (using patched _check_subkeys)

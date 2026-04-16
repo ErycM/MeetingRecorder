@@ -101,6 +101,14 @@ def _check_subkeys(winreg_mod, base_key, path: str) -> list[str]:
     return active
 
 
+# Python interpreter family — source-run case. Either python.exe or pythonw.exe
+# may register in CapabilityAccessManager depending on whether the app was
+# launched with/without a console. Treat them as equivalent so a source-run
+# MeetingRecorder self-excludes correctly no matter which variant Windows
+# records. Frozen-exe (MeetingRecorder.exe) uses exact-match only.
+_PYTHON_INTERPRETER_ALIASES: frozenset[str] = frozenset({"python.exe", "pythonw.exe"})
+
+
 def _is_self(key_name: str, self_exclusion: str) -> bool:
     """Return True if *key_name* refers to our own process.
 
@@ -108,22 +116,37 @@ def _is_self(key_name: str, self_exclusion: str) -> bool:
     the last segment to *self_exclusion* case-insensitively.  Also compare the
     full key name directly for packaged-app identifiers.
 
+    Python interpreter aliasing: when running from source, ``sys.executable``
+    resolves to ``python.exe`` but Windows may record mic usage under
+    ``pythonw.exe`` (the GUI-subsystem variant) for Tk-based apps. Both names
+    point at the same interpreter family, so we treat them as equivalent when
+    ``self_exclusion`` is one of them. For frozen EXEs this aliasing is skipped.
+
     Examples::
 
         key_name = "C:#Program Files#Python312#python.exe"
-        self_exclusion = "python.exe"   → True  (source-run case)
+        self_exclusion = "python.exe"   → True  (source-run, exact)
+
+        key_name = "C:#Program Files#Python312#pythonw.exe"
+        self_exclusion = "python.exe"   → True  (source-run, aliased)
 
         key_name = "C:#Users#me#AppData#MeetingRecorder#MeetingRecorder.exe"
         self_exclusion = "MeetingRecorder.exe"  → True  (frozen case)
 
-        key_name = "C:#Program Files#Python312#python.exe"
-        self_exclusion = "MeetingRecorder.exe"  → False  (another Python proc)
+        key_name = "C:#Users#Alice#AppData#OtherApp#OtherApp.exe"
+        self_exclusion = "MeetingRecorder.exe"  → False  (different frozen app)
     """
     exc_lower = self_exclusion.lower()
     # NonPackaged: last segment of the #-encoded path
     segments = key_name.split("#")
     last_segment = segments[-1].lower()
     if last_segment == exc_lower:
+        return True
+    # Python interpreter aliasing: source-run case only
+    if (
+        exc_lower in _PYTHON_INTERPRETER_ALIASES
+        and last_segment in _PYTHON_INTERPRETER_ALIASES
+    ):
         return True
     # Packaged: full name comparison (e.g. a UWP app)
     if key_name.lower() == exc_lower:

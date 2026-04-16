@@ -237,8 +237,22 @@ class Orchestrator:
             )
         except Exception as exc:
             log.error("[ORCH] NPU startup check failed: %s", exc)
+            # Even when readiness fails (e.g. configured model not found), try
+            # to surface the list of valid NPU-backed models so the user can
+            # recover via Settings without restarting. Best-effort — a fresh
+            # list_npu_models() call on top of the already-failed ensure_ready.
+            available: list[str] = []
+            try:
+                from app.npu_guard import list_npu_models
+                from app.services.transcription import LEMONADE_URL
+
+                available = list_npu_models(LEMONADE_URL)
+            except Exception as list_exc:
+                log.debug(
+                    "[ORCH] Could not enumerate NPU models post-failure: %s", list_exc
+                )
             self._window.dispatch(  # type: ignore[attr-defined]
-                lambda e=exc: self._on_npu_failed(str(e))
+                lambda e=exc, m=available: self._on_npu_failed(str(e), m)
             )
 
     def _on_npu_ready(self, npu_status: object) -> None:
@@ -253,9 +267,25 @@ class Orchestrator:
         if self._sm.current is AppState.IDLE:
             self._sm.transition(AppState.ARMED)
 
-    def _on_npu_failed(self, error: str) -> None:
-        """Called on T1 after failed NPU check."""
+    def _on_npu_failed(
+        self, error: str, available_models: list[str] | None = None
+    ) -> None:
+        """Called on T1 after failed NPU check.
+
+        If *available_models* is non-empty, still populate the Settings model
+        dropdown so the user can pick a valid model and hit Retry — otherwise
+        the ERROR state is a dead end whenever the configured model name
+        doesn't match what Lemonade has installed.
+        """
         from app.state import AppState, ErrorReason
+
+        if available_models:
+            self._window.settings_tab.set_available_models(available_models)  # type: ignore[attr-defined]
+            log.info(
+                "[ORCH] NPU failed but %d NPU-backed model(s) are available: %s",
+                len(available_models),
+                available_models,
+            )
 
         self._window.settings_tab.set_npu_status(False, error)  # type: ignore[attr-defined]
         log.error("[ORCH] NPU not ready: %s", error)
