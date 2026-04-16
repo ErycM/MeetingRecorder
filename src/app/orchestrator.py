@@ -507,6 +507,16 @@ class Orchestrator:
         except Exception as exc:
             log.warning("[ORCH] History index add failed: %s", exc)
 
+        # Refresh the History tab immediately so the new entry shows up
+        # without requiring a tab switch / reconcile round-trip. We're
+        # already on T1 here (called via dispatch from _save_transcript).
+        try:
+            self._window.history_tab.render_entries(  # type: ignore[attr-defined]
+                self._history_index.list()
+            )
+        except Exception as exc:
+            log.warning("[ORCH] History tab refresh failed: %s", exc)
+
         self._window.live_tab.set_saved_path(md_path)  # type: ignore[attr-defined]
         log.info("[ORCH] Transcript saved: %s", md_path.name)
         self._transition_to_armed()

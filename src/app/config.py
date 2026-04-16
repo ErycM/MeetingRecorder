@@ -78,7 +78,7 @@ class Config:
     wav_dir: Path | None = None
     whisper_model: str = _DEFAULT_WHISPER_MODEL
     silence_timeout: int = _DEFAULT_SILENCE_TIMEOUT
-    live_captions_enabled: bool = False
+    live_captions_enabled: bool = True
     launch_on_login: bool = False
     global_hotkey: str | None = _DEFAULT_HOTKEY
 
@@ -120,7 +120,7 @@ def load(path: Path | None = None) -> Config:
             wav_dir=Path(data["wav_dir"]) if data.get("wav_dir") else None,
             whisper_model=str(data.get("whisper_model", _DEFAULT_WHISPER_MODEL)),
             silence_timeout=int(data.get("silence_timeout", _DEFAULT_SILENCE_TIMEOUT)),
-            live_captions_enabled=bool(data.get("live_captions_enabled", False)),
+            live_captions_enabled=bool(data.get("live_captions_enabled", True)),
             launch_on_login=bool(data.get("launch_on_login", False)),
             global_hotkey=data.get("global_hotkey") or None,
             _source_path=resolved,
