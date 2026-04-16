@@ -42,8 +42,69 @@ log = logging.getLogger(__name__)
 # Temp directory for in-progress WAV files
 _TEMP_DIR = Path(tempfile.gettempdir()) / "meeting_recorder"
 
+# Persistent fallback directories used when the user hasn't configured
+# vault_dir / wav_dir. Living under APPDATA means Windows won't clean
+# them out from under us (unlike %TEMP%) and the user gets a working
+# meeting archive on first run without touching Settings.
+_APPDATA_DIR = (
+    Path(os.environ.get("APPDATA", tempfile.gettempdir())) / "MeetingRecorder"
+)
+_DEFAULT_TRANSCRIPT_DIR = _APPDATA_DIR / "transcripts"
+_DEFAULT_WAV_DIR = _APPDATA_DIR / "wavs"
+
 # Default icon path relative to project root
 _DEFAULT_ICON = Path(__file__).parent.parent.parent / "assets" / "SaveLC.ico"
+
+# Minimum transcript length (chars) to be worth saving. Anything below this
+# is almost certainly Whisper hallucination on near-silent input.
+_MIN_TRANSCRIPT_CHARS = 30
+
+# Known Whisper hallucinations on silent or low-SNR audio. We reject any
+# transcript whose normalised form (lowercased, no punctuation) is in this
+# set, regardless of length. Add new ones as we observe them in the wild.
+_HALLUCINATION_PHRASES: frozenset[str] = frozenset(
+    {
+        "thank you",
+        "thanks for watching",
+        "thanks for watching!",
+        "you",
+        "bye",
+        "bye bye",
+        "music",
+        "[music]",
+        "[blank_audio]",
+        "applause",
+        "[applause]",
+        ".",
+        "..",
+        "...",
+    }
+)
+
+
+def _is_useful_transcript(text: str) -> bool:
+    """Return True if *text* looks like real speech (not silence/hallucination).
+
+    Filters out:
+    - empty / whitespace-only
+    - shorter than _MIN_TRANSCRIPT_CHARS after stripping
+    - exact matches against _HALLUCINATION_PHRASES (case + punctuation
+      insensitive)
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < _MIN_TRANSCRIPT_CHARS:
+        # Even short text is acceptable IF it's not a known hallucination
+        # phrase — but at this length the signal/noise ratio is awful.
+        # Reject anything below the minimum.
+        return False
+    # Check normalised form against known noise phrases
+    normalised = "".join(c for c in stripped.lower() if c.isalnum() or c.isspace())
+    normalised = " ".join(normalised.split())
+    if normalised in _HALLUCINATION_PHRASES:
+        return False
+    return True
 
 
 def _read_lockfile_exclusion() -> str:
@@ -424,7 +485,7 @@ class Orchestrator:
         stream_text = getattr(self, "_stream_text_cache", "")
         self._stream_text_cache = ""
 
-        if stream_text and len(stream_text.strip()) >= 10:
+        if _is_useful_transcript(stream_text):
             # Use streaming transcript — save in background
             threading.Thread(
                 target=self._save_transcript,
@@ -481,10 +542,14 @@ class Orchestrator:
         """Batch-transcribe wav_path then save. Runs on T6."""
         try:
             text = self._transcription_svc.transcribe_file(wav_path)  # type: ignore[attr-defined]
-            if text and len(text.strip()) >= 10:
+            if _is_useful_transcript(text):
                 self._save_transcript(wav_path, text, duration_s)
             else:
-                log.info("[ORCH] Transcript too short — skipping save")
+                preview = (text or "").strip()[:60]
+                log.info(
+                    "[ORCH] Transcript filtered (silence or hallucination): %r",
+                    preview,
+                )
                 try:
                     wav_path.unlink(missing_ok=True)
                 except OSError:
@@ -682,8 +747,8 @@ class Orchestrator:
         """Background worker for re-transcription."""
         try:
             text = self._transcription_svc.transcribe_file(wav_path)  # type: ignore[attr-defined]
-            if not text or len(text.strip()) < 10:
-                log.info("[ORCH] Re-transcription too short — skipping")
+            if not _is_useful_transcript(text):
+                log.info("[ORCH] Re-transcription filtered (silence/hallucination)")
                 return
 
             # Write a new .md with _retranscribed suffix
@@ -835,10 +900,11 @@ class Orchestrator:
         vault_dir = getattr(self._config, "vault_dir", None)
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{timestamp}_transcript.md"
-        if vault_dir is not None:
-            vault_dir.mkdir(parents=True, exist_ok=True)
-            return vault_dir / filename
-        return _TEMP_DIR / filename
+        # Fall back to APPDATA (persistent) instead of TEMP (Windows-cleaned)
+        # so transcripts survive disk-cleanup and re-launch.
+        target_dir = vault_dir if vault_dir is not None else _DEFAULT_TRANSCRIPT_DIR
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir / filename
 
     def _write_md(self, path: Path, text: str, duration_s: float | None) -> None:
         """Write a Markdown transcript file."""
@@ -852,11 +918,14 @@ class Orchestrator:
         path.write_text("\n".join(lines), encoding="utf-8")
 
     def _archive_wav(self, wav_path: Path, md_path: Path) -> Path | None:
-        """Move the temp WAV to the configured WAV archive directory."""
-        wav_dir = getattr(self._config, "wav_dir", None)
-        if wav_dir is None:
-            log.debug("[ORCH] No wav_dir configured — WAV not archived")
-            return None
+        """Move the temp WAV to the configured WAV archive directory.
+
+        Falls back to APPDATA when wav_dir is not configured — otherwise
+        the temp WAV stays orphaned and Windows can clean it up, breaking
+        Re-transcribe. Returning a real path also lets HistoryEntry
+        record wav_path so the History tab's Re-transcribe button works.
+        """
+        wav_dir = getattr(self._config, "wav_dir", None) or _DEFAULT_WAV_DIR
 
         wav_dir.mkdir(parents=True, exist_ok=True)
         dest = wav_dir / (md_path.stem + ".wav")

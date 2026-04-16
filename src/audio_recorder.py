@@ -4,6 +4,7 @@ into a single 16kHz mono WAV file for Whisper transcription.
 
 Uses PyAudioWPatch for WASAPI loopback support on Windows.
 """
+
 import time
 import wave
 import threading
@@ -31,9 +32,7 @@ def _find_loopback_device(pa):
     except OSError:
         raise RuntimeError("WASAPI not available on this system")
 
-    default_output = pa.get_device_info_by_index(
-        wasapi_info["defaultOutputDevice"]
-    )
+    default_output = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
     # Find the loopback device matching the default output
     for i in range(pa.get_device_count()):
@@ -145,8 +144,12 @@ class DualAudioRecorder:
         self._loopback_channels = min(int(loopback_info["maxInputChannels"]), 2)
         loopback_chunk = int(self._loopback_rate * CHUNK_DURATION_MS / 1000)
 
-        log.info(f"[AUDIO] Mic: {mic_info['name']} @ {self._mic_rate}Hz, {self._mic_channels}ch")
-        log.info(f"[AUDIO] Loopback: {loopback_info['name']} @ {self._loopback_rate}Hz, {self._loopback_channels}ch")
+        log.info(
+            f"[AUDIO] Mic: {mic_info['name']} @ {self._mic_rate}Hz, {self._mic_channels}ch"
+        )
+        log.info(
+            f"[AUDIO] Loopback: {loopback_info['name']} @ {self._loopback_rate}Hz, {self._loopback_channels}ch"
+        )
 
         # Open mic stream
         self._mic_stream = self._pa.open(
@@ -171,9 +174,7 @@ class DualAudioRecorder:
         )
 
         # Start writer thread
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, daemon=True
-        )
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
         self._writer_thread.start()
 
         log.info(f"[AUDIO] Recording started → {wav_path}")
@@ -218,12 +219,14 @@ class DualAudioRecorder:
 
     def _mic_callback(self, in_data, frame_count, time_info, status):
         import pyaudiowpatch as pyaudio
+
         if self._recording:
             self._mic_queue.put(in_data)
         return (None, pyaudio.paContinue)
 
     def _loopback_callback(self, in_data, frame_count, time_info, status):
         import pyaudiowpatch as pyaudio
+
         if self._recording:
             self._loopback_queue.put(in_data)
         return (None, pyaudio.paContinue)
@@ -241,7 +244,11 @@ class DualAudioRecorder:
         # How many 16kHz samples per write cycle (~100ms)
         samples_per_cycle = int(TARGET_RATE * CHUNK_DURATION_MS / 1000)
 
-        while self._recording or not self._mic_queue.empty() or not self._loopback_queue.empty():
+        while (
+            self._recording
+            or not self._mic_queue.empty()
+            or not self._loopback_queue.empty()
+        ):
             # Drain mic queue
             while not self._mic_queue.empty():
                 try:
@@ -258,12 +265,17 @@ class DualAudioRecorder:
                     raw = self._loopback_queue.get_nowait()
                     mono = _to_mono_float(raw, self._loopback_channels, 2)
                     resampled = _resample(mono, self._loopback_rate, TARGET_RATE)
-                    loopback_buffer = np.concatenate([loopback_buffer, resampled * LOOPBACK_VOLUME])
+                    loopback_buffer = np.concatenate(
+                        [loopback_buffer, resampled * LOOPBACK_VOLUME]
+                    )
                 except queue.Empty:
                     break
 
             # Mix and write when we have enough samples
-            while len(mic_buffer) >= samples_per_cycle or len(loopback_buffer) >= samples_per_cycle:
+            while (
+                len(mic_buffer) >= samples_per_cycle
+                or len(loopback_buffer) >= samples_per_cycle
+            ):
                 mic_chunk = mic_buffer[:samples_per_cycle]
                 loop_chunk = loopback_buffer[:samples_per_cycle]
 
@@ -277,9 +289,30 @@ class DualAudioRecorder:
                 mixed = np.clip(mic_chunk + loop_chunk, -1.0, 1.0)
 
                 # Track audio level for silence detection
-                rms = float(np.sqrt(np.mean(mixed ** 2)))
+                rms = float(np.sqrt(np.mean(mixed**2)))
                 if rms > SILENCE_RMS_THRESHOLD:
                     self._last_audio_time = time.time()
+
+                # Periodic audio-level heartbeat so we can diagnose silent
+                # recordings (mic muted, BT dropout, loopback exclusive
+                # mode). Logs ~every 5s of recorded audio.
+                self._level_chunks = getattr(self, "_level_chunks", 0) + 1
+                if self._level_chunks % 50 == 0:  # 50 * 100ms = 5s
+                    mic_rms = (
+                        float(np.sqrt(np.mean(mic_chunk**2))) if len(mic_chunk) else 0.0
+                    )
+                    loop_rms = (
+                        float(np.sqrt(np.mean(loop_chunk**2)))
+                        if len(loop_chunk)
+                        else 0.0
+                    )
+                    log.info(
+                        "[AUDIO] level mic=%.4f loop=%.4f mixed=%.4f (>%.4f=active)",
+                        mic_rms,
+                        loop_rms,
+                        rms,
+                        SILENCE_RMS_THRESHOLD,
+                    )
 
                 # Convert to int16 and write
                 pcm = (mixed * 32767).astype(np.int16)
@@ -304,7 +337,9 @@ class DualAudioRecorder:
         remaining = max(len(mic_buffer), len(loopback_buffer))
         if remaining > 0:
             mic_chunk = np.pad(mic_buffer, (0, max(0, remaining - len(mic_buffer))))
-            loop_chunk = np.pad(loopback_buffer, (0, max(0, remaining - len(loopback_buffer))))
+            loop_chunk = np.pad(
+                loopback_buffer, (0, max(0, remaining - len(loopback_buffer)))
+            )
             mixed = np.clip(mic_chunk + loop_chunk, -1.0, 1.0)
             pcm = (mixed * 32767).astype(np.int16)
             wf.writeframes(pcm.tobytes())

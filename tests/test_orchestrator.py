@@ -265,3 +265,60 @@ class TestRetranscribe:
             orch._transcription_svc.transcribe_file.called
             or threading.active_count() >= threads_before
         )
+
+
+# ---------------------------------------------------------------------------
+# _is_useful_transcript — hallucination filter
+# ---------------------------------------------------------------------------
+
+
+class TestUsefulTranscriptFilter:
+    """Verify the silence/hallucination filter rejects known noise outputs."""
+
+    def test_empty_string_rejected(self) -> None:
+        from app.orchestrator import _is_useful_transcript
+
+        assert _is_useful_transcript("") is False
+        assert _is_useful_transcript("   ") is False
+        assert _is_useful_transcript(None) is False  # type: ignore[arg-type]
+
+    def test_whisper_thank_you_hallucination_rejected(self) -> None:
+        """The classic 'Thank you.' hallucination on silent audio."""
+        from app.orchestrator import _is_useful_transcript
+
+        assert _is_useful_transcript("Thank you.") is False
+        assert _is_useful_transcript("thank you") is False
+        assert _is_useful_transcript("  Thank you!  ") is False
+
+    def test_other_known_hallucinations_rejected(self) -> None:
+        from app.orchestrator import _is_useful_transcript
+
+        assert _is_useful_transcript("Thanks for watching!") is False
+        assert _is_useful_transcript("[Music]") is False
+        assert _is_useful_transcript("[BLANK_AUDIO]") is False
+        assert _is_useful_transcript("...") is False
+        assert _is_useful_transcript("you") is False
+
+    def test_short_real_text_rejected(self) -> None:
+        """Below _MIN_TRANSCRIPT_CHARS even if not a known hallucination."""
+        from app.orchestrator import _is_useful_transcript
+
+        assert _is_useful_transcript("Hello world") is False  # 11 chars
+        assert _is_useful_transcript("This is too short") is False  # 17 chars
+
+    def test_real_transcript_accepted(self) -> None:
+        from app.orchestrator import _is_useful_transcript
+
+        # 30+ chars and not a known hallucination
+        assert (
+            _is_useful_transcript(
+                "Hello, this is a real meeting transcript with content."
+            )
+            is True
+        )
+        assert (
+            _is_useful_transcript(
+                "We discussed the Q3 roadmap and the team agreed to ship by Friday."
+            )
+            is True
+        )
