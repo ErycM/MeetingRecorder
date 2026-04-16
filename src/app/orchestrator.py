@@ -267,6 +267,20 @@ class Orchestrator:
         if self._sm.current is AppState.IDLE:
             self._sm.transition(AppState.ARMED)
 
+        # If the user is ALREADY on a call when the app launches, MicWatcher
+        # may have fired on_mic_active before NPU completed and we ignored it
+        # (state was IDLE). MicWatcher is edge-triggered so it won't refire
+        # while the same app keeps holding the mic. Catch this race by asking
+        # MicWatcher whether the mic is currently in use and starting now.
+        # Use `is True` so unit tests with MagicMock don't accidentally fire.
+        try:
+            mic_active = getattr(self._mic_watcher, "is_mic_active", False)
+            if self._sm.current is AppState.ARMED and mic_active is True:
+                log.info("[ORCH] Mic already active at NPU-ready — starting recording")
+                self._on_mic_active()
+        except Exception as exc:
+            log.warning("[ORCH] post-ARMED mic-active check failed: %s", exc)
+
     def _on_npu_failed(
         self, error: str, available_models: list[str] | None = None
     ) -> None:
@@ -522,12 +536,31 @@ class Orchestrator:
         self._transition_to_armed()
 
     def _transition_to_armed(self) -> None:
-        """SAVING → ARMED (back to waiting for mic). Called on T1."""
+        """SAVING → ARMED (back to waiting for mic). Called on T1.
+
+        After re-arming, also re-check whether the mic is still active —
+        MicWatcher is edge-triggered, so any Active event that fired during
+        SAVING was ignored and won't refire while the same app keeps
+        holding the mic. This catches the auto-rearm-while-still-on-call
+        case (e.g. user keeps speaking right after the silence-timeout
+        autostop fires).
+        """
         from app.state import AppState
 
         if self._sm.current is AppState.SAVING:
             self._sm.transition(AppState.IDLE)
             self._sm.transition(AppState.ARMED)
+
+        # Use `is True` so unit tests with MagicMock don't accidentally fire.
+        try:
+            mic_active = getattr(self._mic_watcher, "is_mic_active", False)
+            if self._sm.current is AppState.ARMED and mic_active is True:
+                log.info(
+                    "[ORCH] Mic still active after re-arm — starting next recording"
+                )
+                self._on_mic_active()
+        except Exception as exc:
+            log.warning("[ORCH] post-rearm mic-active check failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Button / hotkey / tray callbacks — all on T1

@@ -542,6 +542,23 @@ class TranscriptionService:
                 if event.type == "session.created":
                     log.info("[STREAM] Session created")
 
+                # Enable server-side VAD so Whisper auto-commits on pauses
+                # and emits transcription events during the session instead
+                # of only at end-of-session. Lemonade's whisper.cpp realtime
+                # backend does not auto-VAD by default — without this we get
+                # 0 segments for the entire call (verified empirically).
+                try:
+                    await conn.session.update(
+                        session={
+                            "input_audio_format": "pcm16",
+                            "input_audio_transcription": {"model": self._model},
+                            "turn_detection": {"type": "server_vad"},
+                        }
+                    )
+                    log.info("[STREAM] session.update sent (server_vad enabled)")
+                except Exception as exc:
+                    log.warning("[STREAM] session.update failed: %s", exc)
+
                 sender = asyncio.create_task(self._send_loop(conn))
                 receiver = asyncio.create_task(self._receive_loop(conn))
 
@@ -602,20 +619,23 @@ class TranscriptionService:
 
     async def _receive_loop(self, conn: object) -> None:
         """Receive transcription events from WebSocket and fire callbacks."""
+        # Diagnostic: count event types we observe so we can prove which
+        # events Lemonade actually emits (vs which we're listening for).
+        event_counts: dict[str, int] = {}
         try:
             async for event in conn:
                 if not self._stream_running:
                     break
 
-                if event.type == "conversation.item.input_audio_transcription.delta":
+                etype = getattr(event, "type", "<no-type>")
+                event_counts[etype] = event_counts.get(etype, 0) + 1
+
+                if etype == "conversation.item.input_audio_transcription.delta":
                     delta = getattr(event, "delta", "")
                     if delta and self._stream_on_delta is not None:
                         self._stream_on_delta(delta)
 
-                elif (
-                    event.type
-                    == "conversation.item.input_audio_transcription.completed"
-                ):
+                elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = getattr(event, "transcript", "")
                     if transcript and transcript.strip():
                         segment = transcript.strip()
@@ -624,15 +644,22 @@ class TranscriptionService:
                         if self._stream_on_completed is not None:
                             self._stream_on_completed(segment)
 
-                elif event.type == "error":
+                elif etype == "error":
                     msg = getattr(getattr(event, "error", None), "message", str(event))
                     log.error("[STREAM] Server error: %s", msg)
-
+                else:
+                    # Surface unknown event types at INFO (only the first
+                    # occurrence of each type) so we can adapt the handler.
+                    if event_counts[etype] == 1:
+                        log.info("[STREAM] Unhandled event type: %s", etype)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             if self._stream_running:
                 log.error("[STREAM] Receive error: %s", exc)
+        finally:
+            if event_counts:
+                log.info("[STREAM] Event-type counts: %s", dict(event_counts))
 
     # ------------------------------------------------------------------
     # Internal — helpers
