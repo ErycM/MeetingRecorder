@@ -1,0 +1,114 @@
+---
+name: AgentSpec
+version: "4.2"
+project: "SaveLiveCaptions"
+profile: "SE"
+
+phases:
+  brainstorm:
+    command: /brainstorm
+    agent: brainstorm-agent
+    model: opus
+    input_types: [raw_idea, file_path, problem_statement]
+    output: "BRAINSTORM_{FEATURE}.md"
+    location: ".claude/sdd/features/"
+    quality_gate:
+      min_questions: 3
+      min_approaches: 2
+      min_validations: 2
+      user_confirmation: required
+
+  define:
+    command: /define
+    agent: define-agent
+    model: opus
+    input_types: [brainstorm_doc, raw_description, user_story]
+    output: "DEFINE_{FEATURE}.md"
+    location: ".claude/sdd/features/"
+    quality_gate:
+      clarity_score: 12
+      clarity_max: 15
+      elements: [problem, users, goals, success_criteria, scope]
+
+  design:
+    command: /design
+    agent: design-agent
+    model: opus
+    input_types: [define_doc]
+    output: "DESIGN_{FEATURE}.md"
+    location: ".claude/sdd/features/"
+    quality_gate:
+      file_manifest: required
+      no_circular_deps: required
+      inline_decisions: required
+      thread_boundaries_explicit: required
+
+  build:
+    command: /build
+    agent: build-agent
+    model: sonnet
+    input_types: [design_doc]
+    output: "BUILD_REPORT_{FEATURE}.md"
+    location: ".claude/sdd/reports/"
+    verification:
+      test_command: "python -m pytest"
+      lint_command: "ruff check"
+      format_command: "ruff format"
+      max_retries: 3
+    quality_gate:
+      all_tasks_complete: required
+      all_tests_pass: required_except_platform_gaps
+      lint_clean: required
+
+  ship:
+    command: /ship
+    agent: ship-agent
+    model: haiku
+    input_types: [define_doc, analysis_doc]
+    output: "SHIPPED_{DATE}.md"
+    location: ".claude/sdd/archive/{FEATURE}/"
+    actions:
+      - move_all_artifacts_to_archive
+      - capture_lessons_learned
+      - note_installer_version_if_bumped
+
+iterate:
+  command: /iterate
+  agent: iterate-agent
+  model: sonnet
+  cascade_rules:
+    BRAINSTORM_changed: [DEFINE, DESIGN]
+    DEFINE_changed: [DESIGN]
+    DESIGN_changed: [code_if_built]
+
+dev_loop:
+  command: /dev
+  agents: [prompt-crafter, dev-loop-executor]
+  safeguards:
+    max_iterations: 30
+    max_retries: 3
+    circuit_breaker: 3
+
+folder_structure:
+  features: ".claude/sdd/features/"
+  reports: ".claude/sdd/reports/"
+  archive: ".claude/sdd/archive/"
+  templates: ".claude/sdd/templates/"
+  architecture: ".claude/sdd/architecture/"
+
+file_naming:
+  brainstorm: "BRAINSTORM_{FEATURE}.md"
+  define: "DEFINE_{FEATURE}.md"
+  design: "DESIGN_{FEATURE}.md"
+  build_report: "BUILD_REPORT_{FEATURE}.md"
+  shipped: "SHIPPED_{YYYY-MM-DD}.md"
+  feature_name_format: SCREAMING_SNAKE_CASE
+
+project_invariants:
+  # These are invariants that build-agent / code-reviewer must preserve
+  - "tkinter calls from non-Tk threads MUST go through widget.window.after(0, ...)"
+  - "PyAudio stream callbacks MUST return (None, paContinue) and MUST NOT raise"
+  - "Lemonade transcription MUST be preceded by ensure_ready()"
+  - "mic_monitor MUST filter _SELF_PATTERN to avoid self-triggering"
+  - "winreg keys MUST be closed (context manager or explicit CloseKey)"
+  - "Inno Setup AppId GUID is FROZEN"
