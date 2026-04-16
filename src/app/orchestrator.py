@@ -443,6 +443,15 @@ class Orchestrator:
         except Exception as exc:
             log.error("[ORCH] Failed to start recording: %s", exc)
             self._recording_svc.set_stream_sink(None)  # type: ignore[attr-defined]
+            # If start_stream succeeded but recording_svc.start failed, the
+            # WebSocket session is still alive — must tear it down or the
+            # next attempt raises "already running" and leaks a thread.
+            try:
+                self._transcription_svc.stop_stream()  # type: ignore[attr-defined]
+            except Exception as stop_exc:
+                log.debug(
+                    "[ORCH] stop_stream during failed-start cleanup: %s", stop_exc
+                )
             return
 
         self._sm.transition(AppState.RECORDING)

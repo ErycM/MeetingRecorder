@@ -298,6 +298,16 @@ class TranscriptionService:
         if file_size > MAX_CHUNK_BYTES:
             return self._transcribe_chunked(wav_path, language)
 
+        return self._transcribe_with_recovery(wav_path, language)
+
+    def _transcribe_with_recovery(self, wav_path: Path, language: str | None) -> str:
+        """Transcribe a single (sub-)WAV with one Lemonade-restart retry.
+
+        Extracted so both the direct path and `_transcribe_chunked` can
+        survive a Lemonade crash/drop mid-batch — previously only the
+        non-chunked path retried, so a 30+ minute meeting could fail
+        entirely on a single transient connection drop.
+        """
         try:
             return self._transcribe_single(wav_path, language)
         except requests.ConnectionError:
@@ -493,7 +503,9 @@ class TranscriptionService:
                     offset,
                     offset + n_frames,
                 )
-                text = self._transcribe_single(Path(chunk_path), language)
+                # Use the recovery wrapper so a Lemonade drop in the
+                # middle of a long meeting doesn't lose every chunk.
+                text = self._transcribe_with_recovery(Path(chunk_path), language)
                 if text:
                     texts.append(text)
 
