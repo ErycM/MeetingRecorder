@@ -504,11 +504,24 @@ class Orchestrator:
             ).start()
 
     def _on_silence_detected(self) -> None:
-        """Called by RecordingService silence checker (on T1 via dispatch)."""
+        """Called by RecordingService silence checker (on T1 via dispatch).
+
+        Drive the state machine through the proper RECORDING→SAVING transition
+        and tear down streaming. Without this, RecordingService.stop() runs
+        (auto-dispatched by the silence checker) but the state machine is
+        never moved out of RECORDING, leaving the orchestrator stuck — every
+        subsequent on_mic_active is ignored because it gates on ARMED, and
+        the app silently stops recording until restarted.
+        """
         log.info("[ORCH] Silence detected — stopping recording")
-        # stop() will be called by RecordingService itself via dispatch;
-        # we just need to ensure state machine catches up
+        # Reset MicWatcher's edge-trigger flag so it re-fires when the meeting
+        # app keeps holding the mic (auto-rearm of the next session).
         self._mic_watcher.reset_active_state()  # type: ignore[attr-defined]
+        # Drive the canonical stop path: this transitions RECORDING→SAVING,
+        # tears down the stream, calls RecordingService.stop() (which is
+        # idempotent, so the silence checker's own dispatched stop() is a
+        # no-op when it eventually runs).
+        self._stop_recording()
 
     def _on_device_lost(self) -> None:
         """WASAPI device lost — enter ERROR state."""
