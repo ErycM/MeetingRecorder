@@ -1,0 +1,235 @@
+"""
+AppWindow — main customtkinter window with tabbed UI.
+
+Contains:
+- CTkTabview with three tabs: Live | History | Settings.
+- Window lifecycle: show / hide (to tray) / quit.
+- Cross-thread dispatch via ``dispatch(fn, *args)`` which calls
+  ``self.after(0, fn, *args)`` — THIS is the single safe entry point
+  for every worker thread that needs to touch UI.
+
+Window title ``"MeetingRecorder"`` is stable across releases so
+``SingleInstance.bring_existing_to_front()`` can find it via Win32 FindWindow.
+
+Close [X] behaviour: withdraw (hide to tray) — not quit.
+Quit is only via tray menu "Quit" item.
+
+Minimum size: 520 × 360 per DEFINE §1.
+
+Threading contract
+------------------
+All methods (except ``dispatch``) MUST be called from T1 (the Tk mainloop).
+``dispatch`` is the ONLY method safe to call from any thread — it schedules
+work on T1 via ``after(0, ...)``.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Callable
+
+log = logging.getLogger(__name__)
+
+WINDOW_TITLE = "MeetingRecorder"
+MIN_W = 520
+MIN_H = 360
+
+
+class AppWindow:
+    """Main application window.
+
+    Parameters
+    ----------
+    config:
+        Current ``Config`` (passed to SettingsTab for initial values).
+    history_index:
+        ``HistoryIndex`` instance (passed to HistoryTab).
+    on_stop:
+        Fired by LiveTab Stop button → orchestrator handles state transition.
+    on_save_config:
+        Fired by SettingsTab Save → orchestrator applies new config.
+    on_retry_npu:
+        Fired by SettingsTab Retry → orchestrator re-runs NPU check.
+    on_quit:
+        Fired by tray Quit action (already dispatched to T1 before call).
+    on_retranscribe:
+        Fired by HistoryTab Re-transcribe action.
+    on_delete_entry:
+        Fired by HistoryTab Delete action.
+    """
+
+    def __init__(
+        self,
+        config: object,
+        history_index: object,
+        *,
+        on_stop: Callable[[], None],
+        on_save_config: Callable[[object], None],
+        on_retry_npu: Callable[[], None] | None = None,
+        on_quit: Callable[[], None] | None = None,
+        on_retranscribe: Callable[[Path], None] | None = None,
+        on_delete_entry: Callable[[Path, "Path | None"], None] | None = None,
+    ) -> None:
+        import customtkinter as ctk
+
+        self._on_quit = on_quit
+        self._config = config
+
+        # Build the main CTk window
+        self._root = ctk.CTk()
+        self._root.title(WINDOW_TITLE)
+        self._root.minsize(MIN_W, MIN_H)
+        self._root.geometry(f"{MIN_W}x{MIN_H}")
+        self._root.resizable(True, True)
+
+        # Hide to tray on [X], never destroy
+        self._root.protocol("WM_DELETE_WINDOW", self.hide)
+
+        # Tab view
+        tabview = ctk.CTkTabview(self._root)
+        tabview.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tab_live = tabview.add("Live")
+        tab_history = tabview.add("History")
+        tab_settings = tabview.add("Settings")
+
+        # Import tab classes (all UI — runs on T1)
+        from ui.live_tab import LiveTab
+        from ui.history_tab import HistoryTab
+        from ui.settings_tab import SettingsTab
+
+        self._live_tab = LiveTab(tab_live, on_stop=on_stop)
+        self._history_tab = HistoryTab(
+            tab_history,
+            history_index=history_index,
+            dispatch=self.dispatch,
+            vault_dir=config.vault_dir if config else None,
+            on_retranscribe=on_retranscribe,
+            on_delete=on_delete_entry,
+        )
+        self._settings_tab = SettingsTab(
+            tab_settings,
+            config=config,
+            on_save=on_save_config,
+            on_retry_npu=on_retry_npu,
+        )
+
+        # Reconcile history when History tab is selected
+        tabview.configure(command=lambda: self._on_tab_change(tabview))
+
+        self._tabview = tabview
+        log.debug("[APP_WINDOW] Window constructed")
+
+    # ------------------------------------------------------------------
+    # Cross-thread dispatch — ONLY method safe from worker threads
+    # ------------------------------------------------------------------
+
+    def dispatch(self, fn: Callable[[], None], *args: object) -> None:
+        """Schedule *fn* on T1 (the Tk mainloop) via after(0, ...).
+
+        This is the SINGLE cross-thread entry point for all worker threads
+        (T2–T10) that need to touch UI state. Never call tkinter methods
+        directly from background threads — always go through this method.
+
+        Parameters
+        ----------
+        fn:
+            Zero-argument callable to run on T1.
+        *args:
+            Positional arguments forwarded to fn via after(0, fn, *args).
+        """
+        if args:
+            self._root.after(0, fn, *args)
+        else:
+            self._root.after(0, fn)
+
+    # ------------------------------------------------------------------
+    # Window lifecycle — T1 only
+    # ------------------------------------------------------------------
+
+    def show(self) -> None:
+        """Make the window visible and bring it to front."""
+        self._root.deiconify()
+        self._root.lift()
+        self._root.focus_force()
+
+    def hide(self) -> None:
+        """Withdraw the window to the tray (does not quit)."""
+        self._root.withdraw()
+
+    def quit(self) -> None:
+        """Destroy the window and exit the Tk mainloop."""
+        try:
+            self._root.destroy()
+        except Exception as exc:
+            log.warning("[APP_WINDOW] destroy() raised: %s", exc)
+
+    def run(self) -> None:
+        """Start the Tk mainloop (blocks until quit())."""
+        self._root.mainloop()
+
+    # ------------------------------------------------------------------
+    # State-change handler — called by orchestrator via dispatch
+    # ------------------------------------------------------------------
+
+    def on_state(self, old: object, new: object, reason: object) -> None:
+        """React to AppState transitions.
+
+        Automatically selects the Live tab when RECORDING begins.
+        Shows an error banner across all tabs when ERROR is entered.
+        Clears captions at the start of each session.
+        """
+        from app.state import AppState
+
+        if new is AppState.RECORDING:
+            self._tabview.set("Live")
+            self._live_tab.clear_captions()
+            self._live_tab.set_recording(True)
+            self._live_tab.set_status("Recording...")
+
+        elif new is AppState.SAVING:
+            self._live_tab.set_recording(False)
+            self._live_tab.set_status("Saving...")
+
+        elif new is AppState.ARMED:
+            self._live_tab.set_recording(False)
+            self._live_tab.set_status("Armed — waiting for mic activity")
+
+        elif new is AppState.IDLE:
+            self._live_tab.set_recording(False)
+
+        elif new is AppState.ERROR:
+            reason_name = reason.name if reason is not None else "UNKNOWN"
+            msg = f"ERROR: {reason_name}"
+            self._live_tab.set_status(msg)
+            self._settings_tab.set_error_banner(reason_name)
+            log.error("[APP_WINDOW] Entered ERROR state: %s", reason_name)
+
+        if new is not AppState.ERROR:
+            self._settings_tab.set_error_banner(None)
+
+    # ------------------------------------------------------------------
+    # Pass-through helpers for orchestrator
+    # ------------------------------------------------------------------
+
+    @property
+    def live_tab(self) -> object:
+        return self._live_tab
+
+    @property
+    def history_tab(self) -> object:
+        return self._history_tab
+
+    @property
+    def settings_tab(self) -> object:
+        return self._settings_tab
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _on_tab_change(self, tabview: object) -> None:
+        selected = tabview.get()
+        if selected == "History":
+            self._history_tab.trigger_reconcile()

@@ -14,13 +14,23 @@ Mic detected ──► Record audio ──► Lemonade Whisper ──► Save .m
 
 | Component | File | Purpose |
 |-----------|------|---------|
-| Mic monitor | `src/mic_monitor.py` | Registry polling (`CapabilityAccessManager`) |
+| Orchestrator | `src/main.py` + `src/app/orchestrator.py` | Entry point + state-machine driver |
+| Config | `src/app/config.py` | TOML read/write (atomic), typed dataclass |
+| State machine | `src/app/state.py` | Explicit AppState enum + transition table |
+| Mic watcher | `src/app/services/mic_watcher.py` | Registry polling (`CapabilityAccessManager`) |
 | Audio recorder | `src/audio_recorder.py` | Dual WASAPI loopback + mic → 16kHz mono WAV |
-| Transcriber (batch) | `src/transcriber.py` | Lemonade HTTP API, auto-starts server + model |
-| Stream transcriber | `src/stream_transcriber.py` | OpenAI realtime WebSocket for live captions |
-| Widget | `src/widget.py` | Floating tkinter overlay, live captions, timer |
-| Orchestrator | `src/main.py` | Ties monitor/recorder/transcriber/widget + tray |
-| Legacy (LC mode) | `SaveLiveCaptionsWithLC.py`, `src/live_captions.py`, `src/function/` | Windows Live Captions UIA scraping path |
+| Recording service | `src/app/services/recording.py` | Wraps DualAudioRecorder with silence-timeout |
+| Transcription service | `src/app/services/transcription.py` | Lemonade HTTP (batch) + WS (streaming) |
+| Caption router | `src/app/services/caption_router.py` | Delta/completed → RenderCommand (pure logic) |
+| History index | `src/app/services/history_index.py` | history.json CRUD + disk reconciliation |
+| Tray service | `src/app/services/tray.py` | pystray shim with dispatch |
+| NPU guard | `src/app/npu_guard.py` | Lemonade model filter + ENFORCE_NPU constant |
+| Single instance | `src/app/single_instance.py` | Named mutex + lockfile fallback |
+| UI window | `src/ui/app_window.py` | CTk shell: Live / History / Settings tabs |
+| Live tab | `src/ui/live_tab.py` | Captions + timer + stop button |
+| History tab | `src/ui/history_tab.py` | Scrollable transcript list + context menu |
+| Settings tab | `src/ui/settings_tab.py` | Config form + NPU diagnostics |
+| Theme | `src/ui/theme.py` | Dark-theme init + style constants |
 
 ---
 
@@ -29,16 +39,32 @@ Mic detected ──► Record audio ──► Lemonade Whisper ──► Save .m
 ```text
 SaveLiveCaptions/
 ├── src/
-│   ├── main.py               # v3 orchestrator (primary entry)
-│   ├── mic_monitor.py
-│   ├── audio_recorder.py
-│   ├── transcriber.py
-│   ├── stream_transcriber.py
-│   ├── widget.py
-│   ├── live_captions.py      # legacy LC integration
-│   └── function/             # legacy text dedup/save/hook
-├── tests/                    # hardware/integration probes
-├── SaveLiveCaptionsWithLC.py # legacy entry point
+│   ├── main.py               # Entry point (~30 lines)
+│   ├── audio_recorder.py     # DualAudioRecorder (WASAPI)
+│   ├── app/
+│   │   ├── config.py         # TOML config
+│   │   ├── state.py          # State machine
+│   │   ├── npu_guard.py      # NPU verification
+│   │   ├── single_instance.py
+│   │   ├── orchestrator.py   # State-machine driver
+│   │   └── services/
+│   │       ├── caption_router.py
+│   │       ├── history_index.py
+│   │       ├── mic_watcher.py
+│   │       ├── recording.py
+│   │       ├── transcription.py
+│   │       └── tray.py
+│   └── ui/
+│       ├── app_window.py
+│       ├── hotkey_capture.py
+│       ├── live_tab.py
+│       ├── history_tab.py
+│       ├── settings_tab.py
+│       └── theme.py
+├── tests/
+│   ├── fixtures/sample_meeting.wav   # 30s 16kHz mono sine-burst WAV
+│   ├── conftest.py
+│   └── test_*.py
 ├── install_startup.py        # Windows startup registration
 ├── installer.iss             # Inno Setup installer script
 ├── requirements.txt
@@ -50,11 +76,10 @@ SaveLiveCaptions/
 ## Commands
 
 ```bash
-python src/main.py                      # run v3 recorder
-python SaveLiveCaptionsWithLC.py        # run legacy LC mode
+python src/main.py                      # run MeetingRecorder
 pip install -r requirements.txt
 python install_startup.py install       # register as Windows startup app
-python -m pytest tests/                 # run tests (minimal suite)
+python -m pytest tests/                 # run tests (build gate)
 ruff format src/ tests/                 # format
 ruff check --fix src/ tests/            # lint + fix
 ```
@@ -83,13 +108,13 @@ ruff check --fix src/ tests/            # lint + fix
 
 ## Critical Rules
 
-1. **Windows-only**. The app relies on `winreg`, WASAPI loopback, `uiautomation`, pystray, `LemonadeServer.exe`. Never add pure-Linux primitives in `src/`; WSL cannot run this app, only analyze it.
-2. **All mic/audio/registry callbacks run off the Tk mainloop thread** — dispatch UI updates via `self.widget.window.after(0, ...)`. Never touch tkinter from worker threads.
-3. **Lemonade server must be ready before transcribing**. Call `LemonadeTranscriber.ensure_ready()` up-front; don't assume the HTTP server or model is loaded.
-4. **Self-exclusion in mic detection**. `mic_monitor.py` filters out Python processes from `CapabilityAccessManager` — otherwise the recorder triggers itself.
-5. **Never print secrets or paths from the Obsidian vault in logs without redaction**. Output paths are personal.
-6. **Path constants are hardcoded** (`SAVE_DIR`, `WAV_DIR`, `LEMONADE_SERVER_EXE`) — keep them at the top of the module. Don't sprinkle `os.path.join` calls.
-7. **Two legacy entry points coexist**: v3 (`src/main.py`) is primary; `SaveLiveCaptionsWithLC.py` is the older LC-UIA path. When editing, identify which path before refactoring.
+1. **Windows-only**. The app relies on `winreg`, WASAPI loopback, `pywin32`, pystray, `LemonadeServer.exe`. Never add pure-Linux primitives in `src/`; WSL cannot run this app, only analyze it.
+2. **All service callbacks run off the Tk mainloop thread** — dispatch UI updates via `AppWindow.dispatch(fn)` which calls `self.after(0, fn)`. Never touch customtkinter/tkinter from worker threads.
+3. **Lemonade server must be ready before transcribing**. `TranscriptionService.ensure_ready()` must run before any batch or streaming transcription call and must verify (a) the server is up and (b) the model is loaded on NPU.
+4. **Self-exclusion in mic detection**. `MicWatcher` filters out the recorder's own EXE via the lockfile written by `SingleInstance`. Use `_read_lockfile_exclusion()` in orchestrator — do not hardcode the EXE name.
+5. **Never log vault paths or transcript contents without redaction**. Output paths are personal.
+6. **Config is the single source of truth for runtime settings**. All paths come from `Config.vault_dir` / `Config.wav_dir`. No hardcoded personal paths anywhere in source.
+7. **ENFORCE_NPU = True is a module constant in `npu_guard.py`**. It must not be exposed in `config.toml` or Settings UI. Flip it only for downstream non-Ryzen-AI forks.
 
 ---
 
