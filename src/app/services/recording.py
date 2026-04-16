@@ -121,6 +121,24 @@ class RecordingService:
             return 0.0
         return float(self._recorder.seconds_since_audio)  # type: ignore[attr-defined]
 
+    def get_last_peak_level(self) -> float:
+        """Peak mic+loopback RMS from the last recording, or 0.0 if none yet."""
+        if self._recorder is None:
+            return 0.0
+        try:
+            return float(self._recorder.get_last_peak_level())  # type: ignore[attr-defined]
+        except AttributeError:
+            return 0.0
+
+    def get_last_device_names(self) -> tuple[str, str]:
+        """Return ``(mic_name, loopback_name)`` from the last recording start."""
+        if self._recorder is None:
+            return "", ""
+        try:
+            return self._recorder.get_last_device_names()  # type: ignore[attr-defined]
+        except AttributeError:
+            return "", ""
+
     def set_stream_sink(self, callback: Callable[[bytes], None] | None) -> None:
         """Wire (or clear) the streaming audio chunk callback on the recorder.
 
@@ -130,8 +148,19 @@ class RecordingService:
         if self._recorder is not None:
             self._recorder.set_audio_chunk_callback(callback)  # type: ignore[attr-defined]
 
-    def start(self, wav_path: Path) -> None:
+    def start(
+        self,
+        wav_path: Path,
+        *,
+        mic_device_index: int | None = None,
+        loopback_device_index: int | None = None,
+    ) -> None:
         """Start recording to *wav_path*.
+
+        ``mic_device_index`` / ``loopback_device_index`` optionally pin the
+        WASAPI endpoints; ``None`` preserves the historic auto-detect
+        behaviour. The orchestrator reads these from ``Config`` and
+        forwards them here so the recorder never imports config.py.
 
         Raises
         ------
@@ -157,7 +186,11 @@ class RecordingService:
         self._start_time = time.time()
 
         wav_path_obj = self._wav_path
-        self._recorder.start(str(wav_path_obj))  # type: ignore[union-attr]
+        self._recorder.start(  # type: ignore[union-attr]
+            str(wav_path_obj),
+            mic_device_index=mic_device_index,
+            loopback_device_index=loopback_device_index,
+        )
 
         # Start silence-timeout checker
         self._silence_stop_event.clear()

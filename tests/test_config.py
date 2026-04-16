@@ -49,6 +49,12 @@ class TestConfigDefaults:
         cfg = Config()
         assert cfg.silence_timeout >= 1
 
+    def test_default_device_indices_are_none(self) -> None:
+        """Fresh Config has no audio-device overrides (auto-detect)."""
+        cfg = Config()
+        assert cfg.mic_device_index is None
+        assert cfg.loopback_device_index is None
+
 
 class TestConfigRoundTrip:
     def test_save_and_load_round_trip(self, tmp_path: Path) -> None:
@@ -84,6 +90,30 @@ class TestConfigRoundTrip:
         assert loaded.vault_dir is None
         assert loaded.wav_dir is None
         assert loaded.global_hotkey is None
+        assert loaded.mic_device_index is None
+        assert loaded.loopback_device_index is None
+
+    def test_device_indices_round_trip(self, tmp_path: Path) -> None:
+        """Non-None mic/loopback device indices round-trip through TOML."""
+        path = _config_path(tmp_path)
+        cfg = Config(mic_device_index=4, loopback_device_index=12)
+        save(cfg, path=path)
+        loaded = load(path=path)
+
+        assert loaded.mic_device_index == 4
+        assert loaded.loopback_device_index == 12
+
+    def test_none_device_indices_are_not_written(self, tmp_path: Path) -> None:
+        """None device indices stay omitted from config.toml."""
+        import tomllib
+
+        path = _config_path(tmp_path)
+        cfg = Config(mic_device_index=None, loopback_device_index=None)
+        save(cfg, path=path)
+
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        assert "mic_device_index" not in data
+        assert "loopback_device_index" not in data
 
     def test_save_creates_parent_directory(self, tmp_path: Path) -> None:
         """save() creates missing parent directories."""
@@ -127,6 +157,21 @@ class TestConfigErrors:
         path.parent.mkdir(parents=True, exist_ok=True)
         # silence_timeout should be an int, write a non-numeric string
         path.write_text('silence_timeout = "not_an_int"', encoding="utf-8")
+
+        with pytest.raises(ConfigError):
+            load(path=path)
+
+    def test_negative_mic_device_index_raises(self) -> None:
+        """Config with negative device index raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(mic_device_index=-1)
+
+    def test_boolean_device_index_in_toml_raises(self, tmp_path: Path) -> None:
+        """A bool written into mic_device_index (e.g. ``true``) must not be
+        silently coerced to ``1`` — that would pick a real device."""
+        path = _config_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("mic_device_index = true", encoding="utf-8")
 
         with pytest.raises(ConfigError):
             load(path=path)

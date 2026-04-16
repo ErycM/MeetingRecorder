@@ -178,9 +178,7 @@ class HistoryTab:
             except Exception as exc:
                 log.error("[HISTORY] Reconcile error: %s", exc)
                 msg = f"Reconcile error: {exc}"
-                self._dispatch(
-                    lambda m=msg: self._status.configure(text=m)
-                )
+                self._dispatch(lambda m=msg: self._status.configure(text=m))
 
         threading.Thread(target=_worker, name="history-reconcile", daemon=True).start()
 

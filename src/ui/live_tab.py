@@ -51,16 +51,44 @@ class LiveTab:
         self,
         parent: object,
         on_stop: Callable[[], None],
+        on_dismiss_capture_warning: Callable[[], None] | None = None,
     ) -> None:
         import customtkinter as ctk
         from ui import theme
 
         self._on_stop = on_stop
+        self._on_dismiss_capture_warning = on_dismiss_capture_warning
         self._is_recording = False
 
         # Outer frame fills the tab
         self.frame = ctk.CTkFrame(parent)
         self.frame.pack(fill="both", expand=True, padx=theme.PAD_X, pady=theme.PAD_Y)
+
+        # Capture-warning banner — hidden by default. Shown when the
+        # orchestrator detects consecutive silent recordings (wrong audio
+        # endpoint picked) so the user has a visible signal instead of
+        # an invisible auto-rearm loop.
+        self._capture_warning_frame = ctk.CTkFrame(
+            self.frame, fg_color="#5a2a2a", corner_radius=6
+        )
+        self._capture_warning_label = ctk.CTkLabel(
+            self._capture_warning_frame,
+            text="",
+            anchor="w",
+            justify="left",
+            font=theme.FONT_STATUS,
+            wraplength=520,
+        )
+        self._capture_warning_label.pack(
+            side="left", fill="x", expand=True, padx=theme.PAD_INNER, pady=4
+        )
+        self._capture_warning_dismiss = ctk.CTkButton(
+            self._capture_warning_frame,
+            text="Dismiss",
+            width=80,
+            command=self._on_capture_warning_dismissed,
+        )
+        self._capture_warning_dismiss.pack(side="right", padx=theme.PAD_INNER, pady=4)
 
         # Timer label
         self._timer_label = ctk.CTkLabel(
@@ -168,6 +196,33 @@ class LiveTab:
         self._text.mark_set(_PARTIAL_MARK_END, "end")
         self._text.config(state="disabled")
 
+    def show_capture_warning(self, mic_name: str, loopback_name: str) -> None:
+        """Show the silent-capture banner naming the currently-selected devices.
+
+        Called by the orchestrator after N consecutive recordings captured
+        pure silence — tells the user the app is alive but listening to the
+        wrong endpoint, and points them at Settings.
+        """
+        mic = mic_name or "Windows default mic"
+        loop = loopback_name or "Windows default loopback"
+        self._capture_warning_label.configure(
+            text=(
+                f"Last recordings captured silence from {mic} / {loop}. "
+                "Auto-record paused — pick the correct mic/loopback in "
+                "Settings, then Dismiss."
+            )
+        )
+        self._capture_warning_frame.pack(
+            fill="x", padx=0, pady=(0, 4), before=self._timer_label
+        )
+
+    def hide_capture_warning(self) -> None:
+        """Hide the capture-warning banner (called on successful capture)."""
+        try:
+            self._capture_warning_frame.pack_forget()
+        except Exception:
+            pass
+
     def handle_render_command(self, cmd: object) -> None:
         """Apply a RenderCommand from CaptionRouter.
 
@@ -249,3 +304,15 @@ class LiveTab:
     def _on_stop_clicked(self) -> None:
         if self._is_recording and self._on_stop is not None:
             self._on_stop()
+
+    def _on_capture_warning_dismissed(self) -> None:
+        """Banner Dismiss button — hide it and notify the orchestrator so it
+        can reset its silent-recording counter and re-enable auto-rearm."""
+        self.hide_capture_warning()
+        if self._on_dismiss_capture_warning is not None:
+            try:
+                self._on_dismiss_capture_warning()
+            except Exception as exc:
+                log.warning(
+                    "[LIVE] on_dismiss_capture_warning callback raised: %s", exc
+                )

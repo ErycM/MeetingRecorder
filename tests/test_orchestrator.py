@@ -91,6 +91,8 @@ def _make_orchestrator(cfg: Config) -> object:
     orch._timer_after_id = None
     orch._hotkey_registered = None
     orch._stream_text_cache = ""
+    orch._consecutive_silent_filtered = 0
+    orch._capture_warning_active = False
 
     return orch, states
 
@@ -322,3 +324,105 @@ class TestUsefulTranscriptFilter:
             )
             is True
         )
+
+
+# ---------------------------------------------------------------------------
+# Silent-capture safety net (_transition_to_armed auto-rearm suppression)
+# ---------------------------------------------------------------------------
+
+
+class TestSilentLoopSafetyNet:
+    """After N consecutive silent-filtered recordings the auto-rearm path
+    must stop firing and surface a capture-warning banner — otherwise the
+    user gets stuck in an invisible 5-second loop of filtered hallucinations.
+    """
+
+    def _prime_armed(self, orch) -> None:
+        """Walk the state machine into ARMED via a realistic path."""
+        orch._sm.transition(AppState.ARMED)
+        orch._sm.transition(AppState.RECORDING)
+        orch._sm.transition(AppState.SAVING)
+
+    def test_first_silent_filtered_does_not_suppress_rearm(
+        self, tmp_path: Path
+    ) -> None:
+        """Counter=1 still auto-rearms if the mic is held."""
+        cfg = _make_config(tmp_path)
+        orch, _ = _make_orchestrator(cfg)
+
+        orch._mic_watcher.is_mic_active = True
+        orch._consecutive_silent_filtered = 1
+        orch._start_recording = MagicMock()  # intercept follow-up
+
+        self._prime_armed(orch)
+        orch._transition_to_armed()
+
+        assert orch._sm.current is AppState.RECORDING or orch._start_recording.called
+        assert orch._capture_warning_active is False
+        orch._window.show_capture_warning.assert_not_called()
+
+    def test_limit_hit_suppresses_rearm_and_shows_banner(self, tmp_path: Path) -> None:
+        """Counter >= _SILENT_LOOP_LIMIT skips rearm and pops the banner."""
+        from app.orchestrator import _SILENT_LOOP_LIMIT
+
+        cfg = _make_config(tmp_path)
+        orch, _ = _make_orchestrator(cfg)
+
+        orch._mic_watcher.is_mic_active = True
+        orch._consecutive_silent_filtered = _SILENT_LOOP_LIMIT
+        orch._recording_svc.get_last_device_names.return_value = (
+            "HSP Headset",
+            "Speakers [Loopback]",
+        )
+        orch._start_recording = MagicMock()
+
+        self._prime_armed(orch)
+        orch._transition_to_armed()
+
+        # State reached ARMED (we transitioned in this call) but the rearm
+        # side-effect was skipped.
+        assert orch._sm.current is AppState.ARMED
+        assert orch._capture_warning_active is True
+        orch._window.show_capture_warning.assert_called_once_with(
+            "HSP Headset", "Speakers [Loopback]"
+        )
+        orch._start_recording.assert_not_called()
+
+    def test_banner_shown_only_once(self, tmp_path: Path) -> None:
+        """If the user ignores the banner and another cycle happens, don't
+        re-pop the modal — ``_capture_warning_active`` acts as a latch."""
+        from app.orchestrator import _SILENT_LOOP_LIMIT
+
+        cfg = _make_config(tmp_path)
+        orch, _ = _make_orchestrator(cfg)
+
+        orch._mic_watcher.is_mic_active = True
+        orch._consecutive_silent_filtered = _SILENT_LOOP_LIMIT
+        orch._recording_svc.get_last_device_names.return_value = ("m", "l")
+
+        self._prime_armed(orch)
+        orch._transition_to_armed()  # shows banner
+        orch._sm.transition(AppState.RECORDING)
+        orch._sm.transition(AppState.SAVING)
+        orch._transition_to_armed()  # must not show banner again
+
+        assert orch._window.show_capture_warning.call_count == 1
+
+    def test_dismiss_resets_counter_and_rearm_resumes(self, tmp_path: Path) -> None:
+        """Dismissing the banner clears the latch and triggers a fresh
+        recording attempt if the mic is still held."""
+        cfg = _make_config(tmp_path)
+        orch, _ = _make_orchestrator(cfg)
+
+        # Simulate a prior suppressed re-arm
+        orch._consecutive_silent_filtered = 5
+        orch._capture_warning_active = True
+        orch._mic_watcher.is_mic_active = True
+        orch._sm.transition(AppState.ARMED)
+
+        orch._on_dismiss_capture_warning()
+
+        assert orch._consecutive_silent_filtered == 0
+        assert orch._capture_warning_active is False
+        # Mic was still active and we were ARMED → fresh recording kicked off.
+        assert orch._sm.current is AppState.RECORDING

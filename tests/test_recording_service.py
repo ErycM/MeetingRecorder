@@ -39,9 +39,20 @@ class FakeDualAudioRecorder:
         self._recording = False
         self._on_audio_chunk = None
         self.seconds_since_audio: float = 0.0
+        self.last_start_kwargs: dict = {}
 
-    def start(self, wav_path: str) -> None:
+    def start(
+        self,
+        wav_path: str,
+        mic_device_index: int | None = None,
+        loopback_device_index: int | None = None,
+    ) -> None:
         self._recording = True
+        self.last_start_kwargs = {
+            "wav_path": wav_path,
+            "mic_device_index": mic_device_index,
+            "loopback_device_index": loopback_device_index,
+        }
 
     def stop(self) -> None:
         self._recording = False
@@ -52,6 +63,12 @@ class FakeDualAudioRecorder:
 
     def set_audio_chunk_callback(self, cb) -> None:
         self._on_audio_chunk = cb
+
+    def get_last_peak_level(self) -> float:
+        return 0.0
+
+    def get_last_device_names(self) -> tuple[str, str]:
+        return "", ""
 
 
 @pytest.fixture()
@@ -131,6 +148,30 @@ class TestStartStop:
             assert fake_recorder.is_recording is True
             svc.stop()
             assert fake_recorder.is_recording is False
+
+    def test_start_forwards_device_indices(self, fake_recorder, tmp_path):
+        """Device-index overrides passed to start() reach DualAudioRecorder."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            wav = tmp_path / "out.wav"
+            svc.start(wav, mic_device_index=5, loopback_device_index=11)
+            assert fake_recorder.last_start_kwargs["mic_device_index"] == 5
+            assert fake_recorder.last_start_kwargs["loopback_device_index"] == 11
+            svc.stop()
+
+    def test_start_forwards_none_by_default(self, fake_recorder, tmp_path):
+        """Omitting overrides passes None through so the recorder auto-picks."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            wav = tmp_path / "out.wav"
+            svc.start(wav)
+            assert fake_recorder.last_start_kwargs["mic_device_index"] is None
+            assert fake_recorder.last_start_kwargs["loopback_device_index"] is None
+            svc.stop()
 
     def test_stream_sink_cleared_before_stop(self, fake_recorder, tmp_path):
         """I-5: set_audio_chunk_callback(None) is called before recorder.stop()."""

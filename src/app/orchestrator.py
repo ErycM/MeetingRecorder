@@ -59,6 +59,19 @@ _DEFAULT_ICON = Path(__file__).parent.parent.parent / "assets" / "SaveLC.ico"
 # is almost certainly Whisper hallucination on near-silent input.
 _MIN_TRANSCRIPT_CHARS = 30
 
+# Consecutive silent-filtered recordings before we stop auto-rearming and
+# surface the capture-warning banner. With a 30 s silence-autostop, 4 cycles
+# = ~2 minutes of pure dead air before we assume the audio endpoint is wrong
+# rather than the meeting being quiet. Keeps natural pauses (presenter
+# sharing a screen, someone on mute) from triggering the banner while still
+# catching genuinely broken capture.
+_SILENT_LOOP_LIMIT: int = 4
+
+# Peak mic+loopback RMS below this counts as "pure silence". Must match
+# the recorder's SILENCE_RMS_THRESHOLD so a recording that triggered the
+# silence auto-stop is treated as silent here too.
+_SILENT_PEAK_THRESHOLD: float = 0.005
+
 # Known Whisper hallucinations on silent or low-SNR audio. We reject any
 # transcript whose normalised form (lowercased, no punctuation) is in this
 # set, regardless of length. Add new ones as we observe them in the wild.
@@ -166,6 +179,15 @@ class Orchestrator:
         self._timer_after_id: object = None
         self._hotkey_registered: str | None = None
 
+        # Silent-capture safety net. Whisper hallucinates "Thank you." (etc.)
+        # on pure-silence audio; if the chosen WASAPI endpoints never receive
+        # samples above SILENCE_RMS_THRESHOLD, every recording gets filtered
+        # and the re-arm path would loop forever while the user sees nothing
+        # save. After SILENT_LOOP_LIMIT consecutive silent-filtered recordings
+        # we pause auto-rearm and surface a capture-warning banner.
+        self._consecutive_silent_filtered: int = 0
+        self._capture_warning_active: bool = False
+
         # Load history from disk
         try:
             self._history_index.load()
@@ -202,6 +224,7 @@ class Orchestrator:
             on_quit=self._on_quit,
             on_retranscribe=self._on_retranscribe,
             on_delete_entry=self._on_delete_entry,
+            on_dismiss_capture_warning=self._on_dismiss_capture_warning,
         )
 
         # Wire CaptionRouter → live_tab
@@ -437,8 +460,14 @@ class Orchestrator:
                     ),
                 )
 
-            # Start audio recording
-            self._recording_svc.start(wav_path)  # type: ignore[attr-defined]
+            # Start audio recording — thread the optional WASAPI device
+            # overrides from Config so users with Bluetooth headsets (A2DP
+            # vs HSP/HFP split) can pin the right endpoint.
+            self._recording_svc.start(  # type: ignore[attr-defined]
+                wav_path,
+                mic_device_index=self._config.mic_device_index,
+                loopback_device_index=self._config.loopback_device_index,
+            )
 
         except Exception as exc:
             log.error("[ORCH] Failed to start recording: %s", exc)
@@ -572,6 +601,26 @@ class Orchestrator:
                     "[ORCH] Transcript filtered (silence or hallucination): %r",
                     preview,
                 )
+                # Distinguish "real quiet speech that Whisper mangled" from
+                # "WASAPI stream delivered pure zeros" — the latter means
+                # the user picked the wrong endpoint and we must stop the
+                # silent re-arm loop. peak_level is written by T5 which
+                # has already exited; the read is a safe atomic float.
+                try:
+                    peak = float(
+                        self._recording_svc.get_last_peak_level()  # type: ignore[attr-defined]
+                    )
+                except Exception:
+                    peak = 0.0
+                if peak < _SILENT_PEAK_THRESHOLD:
+                    self._consecutive_silent_filtered += 1
+                    log.info(
+                        "[ORCH] Silent recording #%d (peak=%.4f)",
+                        self._consecutive_silent_filtered,
+                        peak,
+                    )
+                else:
+                    self._consecutive_silent_filtered = 0
                 try:
                     wav_path.unlink(missing_ok=True)
                 except OSError:
@@ -620,6 +669,15 @@ class Orchestrator:
 
         self._window.live_tab.set_saved_path(md_path)  # type: ignore[attr-defined]
         log.info("[ORCH] Transcript saved: %s", md_path.name)
+        # Clean capture — reset the safety-net counter and clear any banner
+        # the user may have left up from a previous misconfiguration.
+        self._consecutive_silent_filtered = 0
+        if self._capture_warning_active:
+            self._capture_warning_active = False
+            try:
+                self._window.hide_capture_warning()  # type: ignore[attr-defined]
+            except Exception as exc:
+                log.debug("[ORCH] hide_capture_warning failed: %s", exc)
         self._transition_to_armed()
 
     def _transition_to_armed(self) -> None:
@@ -637,6 +695,29 @@ class Orchestrator:
         if self._sm.current is AppState.SAVING:
             self._sm.transition(AppState.IDLE)
             self._sm.transition(AppState.ARMED)
+
+        # Safety net: if the last N recordings all captured pure silence,
+        # auto-rearming would just repeat the same doomed recording. Pause
+        # the loop and show a banner so the user can fix their mic/loopback
+        # pick in Settings. Counter is reset on any successful transcript
+        # and also by the banner's Dismiss button.
+        if self._consecutive_silent_filtered >= _SILENT_LOOP_LIMIT:
+            if not self._capture_warning_active:
+                log.warning(
+                    "[ORCH] %d silent recordings in a row — pausing auto-rearm, "
+                    "check audio device settings",
+                    self._consecutive_silent_filtered,
+                )
+                self._capture_warning_active = True
+                try:
+                    mic_name, loop_name = self._recording_svc.get_last_device_names()  # type: ignore[attr-defined]
+                except Exception:
+                    mic_name, loop_name = "", ""
+                try:
+                    self._window.show_capture_warning(mic_name, loop_name)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    log.debug("[ORCH] show_capture_warning failed: %s", exc)
+            return
 
         # Use `is True` so unit tests with MagicMock don't accidentally fire.
         try:
@@ -670,6 +751,24 @@ class Orchestrator:
     def _on_hotkey_stop(self) -> None:
         """Global hotkey 'stop & save now' — same as stop button."""
         self._on_stop_button()
+
+    def _on_dismiss_capture_warning(self) -> None:
+        """Banner Dismiss button — reset the safety-net counter and, if the
+        mic is still held by a meeting app, trigger a fresh recording
+        attempt so the user immediately sees whether their new Settings
+        pick works. Called on T1.
+        """
+        from app.state import AppState
+
+        log.info("[ORCH] Capture warning dismissed — resetting silent counter")
+        self._consecutive_silent_filtered = 0
+        self._capture_warning_active = False
+        try:
+            mic_active = getattr(self._mic_watcher, "is_mic_active", False)
+            if self._sm.current is AppState.ARMED and mic_active is True:
+                self._on_mic_active()
+        except Exception as exc:
+            log.warning("[ORCH] post-dismiss mic-active check failed: %s", exc)
 
     def _on_quit(self) -> None:
         """Quit — stop all services, exit."""

@@ -28,6 +28,11 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
+# Label shown for the "let Windows pick" option in both audio-device dropdowns.
+# Mapped to ``None`` in the mic/loopback device maps so ``Config`` receives
+# ``None`` and the recorder falls back to its default-device auto-detection.
+_DEFAULT_DEVICE_LABEL = "Windows default"
+
 
 class SettingsTab:
     """Settings form inside a CTkFrame.
@@ -118,6 +123,52 @@ class SettingsTab:
             width=260,
         )
         self._model_dropdown.grid(row=row, column=1, columnspan=2, pady=4, sticky="w")
+        row += 1
+
+        # Audio device selection. Enumeration is best-effort — if pyaudiowpatch
+        # isn't importable we still render the dropdowns with just the default
+        # option so saving doesn't blow up.
+        mic_options, mic_map = self._build_device_options(
+            want_loopback=False, current_index=config.mic_device_index
+        )
+        loop_options, loop_map = self._build_device_options(
+            want_loopback=True, current_index=config.loopback_device_index
+        )
+        self._mic_device_map = mic_map
+        self._loopback_device_map = loop_map
+
+        ctk.CTkLabel(scroll_frame, text="Microphone device:", anchor="w").grid(
+            row=row, column=0, sticky="w", padx=theme.PAD_INNER, pady=4
+        )
+        self._mic_device_var = tk.StringVar(
+            value=self._device_label_for(mic_map, config.mic_device_index)
+        )
+        self._mic_device_dropdown = ctk.CTkOptionMenu(
+            scroll_frame,
+            variable=self._mic_device_var,
+            values=mic_options or [_DEFAULT_DEVICE_LABEL],
+            width=260,
+        )
+        self._mic_device_dropdown.grid(
+            row=row, column=1, columnspan=2, pady=4, sticky="w"
+        )
+        row += 1
+
+        ctk.CTkLabel(scroll_frame, text="System audio (loopback):", anchor="w").grid(
+            row=row, column=0, sticky="w", padx=theme.PAD_INNER, pady=4
+        )
+        self._loopback_device_var = tk.StringVar(
+            value=self._device_label_for(loop_map, config.loopback_device_index)
+        )
+        self._loopback_device_dropdown = ctk.CTkOptionMenu(
+            scroll_frame,
+            variable=self._loopback_device_var,
+            values=loop_options or [_DEFAULT_DEVICE_LABEL],
+            width=260,
+        )
+        self._loopback_device_dropdown.grid(
+            row=row, column=1, columnspan=2, pady=4, sticky="w"
+        )
         row += 1
 
         # Silence timeout
@@ -267,6 +318,61 @@ class SettingsTab:
     # Internal
     # ------------------------------------------------------------------
 
+    def _build_device_options(
+        self, *, want_loopback: bool, current_index: int | None
+    ) -> tuple[list[str], dict[str, int | None]]:
+        """Enumerate audio devices and return (labels, label→index map).
+
+        ``want_loopback=False`` yields input-capable non-loopback devices
+        (microphones); ``want_loopback=True`` yields loopback devices. The
+        leading entry is always ``_DEFAULT_DEVICE_LABEL`` which maps to
+        ``None`` (i.e. "use Windows default" in the recorder).
+
+        If the currently-saved ``current_index`` is not present in the
+        enumerated list we still add a synthetic entry for it so the
+        dropdown can display the user's saved choice even if the device
+        is temporarily unplugged.
+        """
+        try:
+            from audio_recorder import list_input_devices
+        except Exception as exc:
+            log.warning("[SETTINGS] list_input_devices unavailable: %s", exc)
+            return [_DEFAULT_DEVICE_LABEL], {_DEFAULT_DEVICE_LABEL: None}
+
+        try:
+            devices = list_input_devices()
+        except Exception as exc:
+            log.warning("[SETTINGS] device enumeration failed: %s", exc)
+            devices = []
+
+        labels: list[str] = [_DEFAULT_DEVICE_LABEL]
+        mapping: dict[str, int | None] = {_DEFAULT_DEVICE_LABEL: None}
+        for dev in devices:
+            if bool(dev.get("is_loopback")) != want_loopback:
+                continue
+            label = f"{int(dev['index'])}: {dev['name']}"
+            labels.append(label)
+            mapping[label] = int(dev["index"])
+
+        if current_index is not None and not any(
+            idx == int(current_index) for idx in mapping.values() if idx is not None
+        ):
+            synthetic = f"{int(current_index)}: (saved, device not found)"
+            labels.append(synthetic)
+            mapping[synthetic] = int(current_index)
+
+        return labels, mapping
+
+    @staticmethod
+    def _device_label_for(mapping: dict[str, int | None], index: int | None) -> str:
+        """Reverse-lookup the display label for *index* in *mapping*."""
+        if index is None:
+            return _DEFAULT_DEVICE_LABEL
+        for label, mapped in mapping.items():
+            if mapped == int(index):
+                return label
+        return _DEFAULT_DEVICE_LABEL
+
     def _pick_folder(self, var: "tk.StringVar") -> None:
         import tkinter.filedialog as fd
 
@@ -287,6 +393,9 @@ class SettingsTab:
             self._save_status.configure(text="WAV archive directory is required.")
             return
 
+        mic_idx = self._mic_device_map.get(self._mic_device_var.get())
+        loop_idx = self._loopback_device_map.get(self._loopback_device_var.get())
+
         # Build updated config
         new_cfg = cfg_module.Config(
             vault_dir=Path(vault_str),
@@ -296,6 +405,8 @@ class SettingsTab:
             live_captions_enabled=self._live_var.get(),
             launch_on_login=self._login_var.get(),
             global_hotkey=self._hotkey_capture.get(),
+            mic_device_index=mic_idx,
+            loopback_device_index=loop_idx,
             _source_path=self._config._source_path if self._config else None,
         )
 

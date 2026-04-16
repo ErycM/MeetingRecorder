@@ -61,6 +61,22 @@ class ConfigError(ValueError):
     """Raised when config.toml contains invalid or unparseable TOML."""
 
 
+def _coerce_optional_int(value: object, *, field_name: str) -> int | None:
+    """Return *value* as int, or None if missing/null.
+
+    Bools are rejected because tomllib coerces ``true``/``false`` to bool
+    and ``int(True) == 1`` would silently pick device index 1.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be an integer or omitted, got bool")
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} must be an integer, got {value!r}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
@@ -81,6 +97,12 @@ class Config:
     live_captions_enabled: bool = True
     launch_on_login: bool = False
     global_hotkey: str | None = _DEFAULT_HOTKEY
+    # Optional overrides for WASAPI device selection. ``None`` means "use the
+    # Windows default input device / the loopback matching the default output".
+    # Users with Bluetooth headsets (A2DP vs HSP/HFP profile split) or multiple
+    # mics need to pin an endpoint here to avoid capturing silence during calls.
+    mic_device_index: int | None = None
+    loopback_device_index: int | None = None
 
     # Internal: path this config was loaded from (not serialised)
     _source_path: Path | None = field(default=None, repr=False, compare=False)
@@ -89,6 +111,15 @@ class Config:
         if self.silence_timeout < 1:
             raise ConfigError(
                 f"silence_timeout must be >= 1, got {self.silence_timeout}"
+            )
+        if self.mic_device_index is not None and self.mic_device_index < 0:
+            raise ConfigError(
+                f"mic_device_index must be >= 0 or None, got {self.mic_device_index}"
+            )
+        if self.loopback_device_index is not None and self.loopback_device_index < 0:
+            raise ConfigError(
+                f"loopback_device_index must be >= 0 or None, "
+                f"got {self.loopback_device_index}"
             )
 
 
@@ -123,6 +154,12 @@ def load(path: Path | None = None) -> Config:
             live_captions_enabled=bool(data.get("live_captions_enabled", True)),
             launch_on_login=bool(data.get("launch_on_login", False)),
             global_hotkey=data.get("global_hotkey") or None,
+            mic_device_index=_coerce_optional_int(
+                data.get("mic_device_index"), field_name="mic_device_index"
+            ),
+            loopback_device_index=_coerce_optional_int(
+                data.get("loopback_device_index"), field_name="loopback_device_index"
+            ),
             _source_path=resolved,
         )
     except ConfigError:
@@ -155,6 +192,10 @@ def save(cfg: Config, path: Path | None = None) -> None:
         data["wav_dir"] = str(cfg.wav_dir)
     if cfg.global_hotkey is not None:
         data["global_hotkey"] = cfg.global_hotkey
+    if cfg.mic_device_index is not None:
+        data["mic_device_index"] = int(cfg.mic_device_index)
+    if cfg.loopback_device_index is not None:
+        data["loopback_device_index"] = int(cfg.loopback_device_index)
 
     # Atomic write: temp file in same directory → os.replace
     rand_suffix = secrets.token_hex(4)

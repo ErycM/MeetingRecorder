@@ -70,6 +70,7 @@ class AppWindow:
         on_quit: Callable[[], None] | None = None,
         on_retranscribe: Callable[[Path], None] | None = None,
         on_delete_entry: Callable[[Path, "Path | None"], None] | None = None,
+        on_dismiss_capture_warning: Callable[[], None] | None = None,
     ) -> None:
         import customtkinter as ctk
 
@@ -99,7 +100,11 @@ class AppWindow:
         from ui.history_tab import HistoryTab
         from ui.settings_tab import SettingsTab
 
-        self._live_tab = LiveTab(tab_live, on_stop=on_stop)
+        self._live_tab = LiveTab(
+            tab_live,
+            on_stop=on_stop,
+            on_dismiss_capture_warning=on_dismiss_capture_warning,
+        )
         self._history_tab = HistoryTab(
             tab_history,
             history_index=history_index,
@@ -217,6 +222,14 @@ class AppWindow:
     # ------------------------------------------------------------------
     # Pass-through helpers for orchestrator
     # ------------------------------------------------------------------
+
+    def show_capture_warning(self, mic_name: str, loopback_name: str) -> None:
+        """Forward to ``LiveTab.show_capture_warning`` — must be on T1."""
+        self._live_tab.show_capture_warning(mic_name, loopback_name)
+
+    def hide_capture_warning(self) -> None:
+        """Forward to ``LiveTab.hide_capture_warning`` — must be on T1."""
+        self._live_tab.hide_capture_warning()
 
     @property
     def live_tab(self) -> object:
