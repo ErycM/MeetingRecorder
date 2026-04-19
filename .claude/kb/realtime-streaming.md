@@ -67,8 +67,9 @@ https://github.com/lemonade-sdk/lemonade/blob/main/examples/realtime_transcripti
 
 | Message | Purpose |
 |---------|---------|
-| `conn.input_audio_buffer.append(audio=<base64-pcm16>)` | Feed audio |
-| `conn.input_audio_buffer.commit()` | Signal end-of-utterance; force finalize |
+| `conn.input_audio_buffer.append(audio=<base64-pcm16>)` | Feed audio — one chunk per call, ~10 ms apart |
+| `conn.input_audio_buffer.commit()` | Force finalize remaining buffer on stop |
+| ~~`conn.session.update(...)`~~ | **Do not send.** Lemonade binds the model via URL query and uses built-in VAD defaults. See `.claude/kb/lemonade-whisper-npu.md` → "Non-obvious rules". |
 
 ### Server → client events
 
@@ -91,14 +92,17 @@ Our strategy: **deltas drive the widget** (visual feedback), **completed chunks 
 ## Audio encoding
 
 ```python
-# pcm_bytes is a concatenation of 100-ms PCM16 LE mono 16 kHz buffers
+# Each chunk is a single 100 ms PCM16 LE mono 16 kHz buffer (3200 bytes).
+# Send chunks ONE AT A TIME — never concatenate before appending.
 encoded = base64.b64encode(pcm_bytes).decode("ascii")
 await conn.input_audio_buffer.append(audio=encoded)
+await asyncio.sleep(0.01)                                  # canonical ~10 ms gap
 ```
 
-- **Format must match**: PCM16 little-endian, mono, 16 kHz. The audio recorder already delivers this.
-- **Base64 is required** — the OpenAI SDK encodes the audio field as a base64 string over JSON.
-- **Batch chunks before sending**: we drain the queue every 100 ms and send one larger `append` to reduce WS frame overhead. Sending every 20 ms chunk individually works but thrashes the event loop.
+- **Format must match**: PCM16 little-endian, mono, 16 kHz. `DualAudioRecorder` already delivers this.
+- **Base64 is required** — the OpenAI SDK encodes the `audio` field as a base64 string over JSON.
+- **Per-chunk sends are required, not optional.** Earlier versions of this KB told you to *batch* queued chunks every 100 ms and send one large `append`. That is **wrong for Lemonade** and was the cause of the "empty live captions panel" bug — Lemonade's VAD stays silent when fed bursty large blobs instead of a steady stream. The canonical example (`examples/realtime_transcription.py`) sends one ~85 ms chunk per `append` with a 10 ms sleep between. We match that — see `TranscriptionService._send_loop`.
+- **Do NOT add a `session.update` to set `input_audio_format` — Lemonade infers it**. Sending one OpenAI-style will silently break VAD.
 
 ---
 
@@ -201,9 +205,12 @@ Symptoms and what to check:
 
 ## Practical tips for extending
 
-- **Adding speaker diarization or VAD tuning**: If a future feature needs non-default VAD parameters, use Lemonade's flat `session.update` schema — `{session: {turn_detection: {threshold, silence_duration_ms, prefix_padding_ms}}}` — with **no `type` field** inside `turn_detection`. OpenAI's `{type: "server_vad"}` shape is NOT accepted by Lemonade; it will be silently ignored. Always cross-check against the canonical example before sending any new payload keys.
-- **Changing the model**: Update the `WHISPER_MODEL` constant in `src/app/services/transcription.py`. The batch and streaming paths share this constant — they must stay in sync.
-- **Language hints**: Lemonade may support a `session.update` with language hints, but the canonical example does not use them. Probe on real hardware and verify via `[STREAM] Event-type counts:` before shipping.
+> Any feature that introduces a new client → server payload (speaker diarization, language hints, VAD tuning, etc.) MUST be verified against Lemonade's canonical example via `tools/probe_lemonade_ws.py` before shipping. Payloads that are valid in the OpenAI Realtime spec can silently break Lemonade's pipeline.
+
+- **Adding speaker diarization**: The OpenAI spec has turn-detection parameters on `session.update`. Lemonade's support is **partial and schema-specific** — the flat `{model, turn_detection: {threshold, silence_duration_ms, prefix_padding_ms}}` shape works; the OpenAI-nested shape silently kills VAD. Probe first, don't copy from OpenAI docs.
+- **Changing the model**: Update the single source — `LemonadeTranscriber._model` / `TranscriptionService._model` — and ensure both the batch REST call and the WS `beta.realtime.connect(model=...)` read the same value. Otherwise stream vs batch produce different transcripts.
+- **Language hints**: `conn.session.update(session={"input_audio_transcription": {"language": "en"}})` is an **OpenAI-shape** payload. Verified NOT to work on Lemonade as of 2026-04-17 — sending it disables VAD. If you want language hints, use the REST `language` form-field on the batch side (works), or probe `session.update` variants via the probe tool first.
+- **Diagnosing empty captions**: the fastest bisection is to run `python tools/probe_lemonade_ws.py --session-update none` and see if the canonical pattern produces events against your current Lemonade build. If yes → bug is in the app's audio pipeline (wiring or cadence). If no → Lemonade build or WAV format issue.
 
 ---
 

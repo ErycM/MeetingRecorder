@@ -88,7 +88,15 @@ except requests.ConnectionError:
 
 ## WebSocket realtime API (live captions)
 
-Used by `TranscriptionService` in `src/app/services/transcription.py`. Lemonade exposes an **OpenAI-SDK-compatible but Lemonade-schema-authoritative** Realtime API for streaming transcription. The OpenAI Python SDK speaks the wire protocol Lemonade implements, but the payload shapes inside that protocol differ — always cross-check against Lemonade's canonical example, not OpenAI docs (Critical Rule 8).
+Used by `TranscriptionService._run_ws_loop` / `_send_loop` / `_receive_loop` in `src/app/services/transcription.py`. Lemonade exposes an **OpenAI-SDK-compatible but Lemonade-schema-authoritative** Realtime API for streaming transcription. The OpenAI Python SDK speaks the wire protocol Lemonade implements, but the payload shapes inside that protocol differ — always cross-check against Lemonade's canonical example, not OpenAI docs (Critical Rule 8).
+
+### Non-obvious rules (learned the hard way — verified 2026-04-17)
+
+> 🔴 **Do NOT send `session.update` at all.** The canonical Lemonade example sends none; model is bound via URL query string (`beta.realtime.connect(model=...)`), and Lemonade's built-in VAD defaults (threshold 0.01, silence 800 ms, prefix 250 ms) match our PCM16 16 kHz mono output. Sending an **OpenAI-shaped** `session.update` (`{"input_audio_format": "pcm16", "input_audio_transcription": {"model": ...}, "turn_detection": {"type": "server_vad"}}`) is ACK'd as `session.updated` but silently disables VAD — zero transcription events for the entire session. If you need to send one, use the **flat Lemonade schema** (`{model, turn_detection: {threshold, silence_duration_ms, prefix_padding_ms}}` — no `type`, no nested `input_audio_transcription`) AND verify with `tools/probe_lemonade_ws.py` before shipping.
+
+> 🔴 **Stream audio per-chunk, not batched.** ~10 ms `asyncio.sleep` between `input_audio_buffer.append` calls, one chunk per call. Batching multiple 100 ms chunks into a single `append` (the old pattern) starves Lemonade's VAD and produces zero events even with otherwise-correct audio. This is the opposite of common REST-thinking — WebSocket framing is cheap; VAD continuity is precious.
+
+> 🔴 **Wire the stream sink to `RecordingService` order-independently.** `RecordingService.set_stream_sink(cb)` is safe to call before `start()` because it stores the callback in `_stream_sink` and applies it when the `DualAudioRecorder` is constructed. If you add a second sink API, preserve that invariant — the old guarded version silently dropped callbacks and that produced symptoms identical to the schema/cadence bugs above (empty captions panel, valid WAV, batch `.md` still works).
 
 ### Discovering the WebSocket port
 
@@ -99,21 +107,20 @@ r = requests.get("http://localhost:13305/api/v1/health")
 port = r.json().get("websocket_port", 9000)   # fall back to 9000
 ```
 
-### Connection via OpenAI SDK
-
-We use the `openai` Python SDK's `AsyncOpenAI.beta.realtime.connect` because it speaks the WS protocol Lemonade implements:
+### Canonical connect pattern (matches Lemonade's examples/realtime_transcription.py)
 
 ```python
 client = AsyncOpenAI(
     api_key="unused",                              # Lemonade doesn't auth
-    base_url=f"http://localhost:13305/api/v1",     # REST base (for session init)
+    base_url="http://localhost:13305/api/v1",      # REST base (for SDK plumbing)
     websocket_base_url=f"ws://localhost:{ws_port}",
 )
 
 async with client.beta.realtime.connect(model="Whisper-Large-v3-Turbo") as conn:
-    # conn.recv() returns events
-    # conn.input_audio_buffer.append(audio=<base64>)
-    # conn.input_audio_buffer.commit()
+    event = await conn.recv()
+    assert event.type == "session.created"
+    # DO NOT send session.update — see Non-obvious rules
+    # Start sender + receiver tasks; send each PCM16 chunk individually
 ```
 
 ### Session setup — Approach A2 (defaults-only)
@@ -152,38 +159,55 @@ events for the whole session. Only `{'session.updated': 1}` in the
 `[STREAM] Event-type counts:` log at end of a real speech session means the
 payload was wrong.
 
-### Event types we handle
+### Event types Lemonade emits
 
 | Event | Meaning | Action |
 |-------|---------|--------|
 | `session.created` | Connection ready | Log; begin sending audio |
-| `session.updated` | Session config acknowledged | Log at INFO (first occurrence); no action needed |
-| `input_audio_buffer.speech_started` | VAD detected speech onset | Log at INFO (first occurrence) |
-| `conversation.item.input_audio_transcription.delta` | Incremental text | Fire `on_delta` callback |
-| `conversation.item.input_audio_transcription.completed` | Final text for a segment | Append to `_full_text_segments`; fire `on_completed` |
+| `session.updated` | ACK of any `session.update` (avoid sending — see rule above) | Log only — `{'session.updated': 1}` alone means the payload was wrong |
+| `input_audio_buffer.speech_started` / `.speech_stopped` | VAD boundary | Log (useful debug signal that audio is flowing correctly) |
+| `input_audio_buffer.committed` | Server committed a buffer chunk for transcription | Log |
+| `conversation.item.input_audio_transcription.delta` | Incremental text | Forward to `CaptionRouter.on_delta(text)` |
+| `conversation.item.input_audio_transcription.completed` | Final text for one VAD segment | Append to `_full_text_segments`; forward to `CaptionRouter.on_completed(text)` |
 | `error` | Server-side error | Log and abort the receive loop |
 
-### Sending audio
+### Sending audio (correct pattern)
 
-PCM16 bytes come from the audio recorder's streaming callback. We batch on a 100 ms tick:
+PCM16 bytes come from `audio_recorder.py`'s `_on_audio_chunk` callback (16 kHz mono, ~100 ms per chunk). `TranscriptionService._send_loop` pops one chunk at a time from `_audio_queue` and sends it immediately:
 
 ```python
-# Drain queue, concatenate, base64-encode, send
-combined = b"".join(chunks)
-encoded = base64.b64encode(combined).decode("ascii")
-await conn.input_audio_buffer.append(audio=encoded)
+while self._stream_running:
+    try:
+        chunk = self._audio_queue.get_nowait()
+    except queue.Empty:
+        await asyncio.sleep(SEND_INTERVAL)       # 0.01 s
+        continue
+    await conn.input_audio_buffer.append(
+        audio=base64.b64encode(chunk).decode("ascii"),
+    )
+    await asyncio.sleep(SEND_INTERVAL)           # 0.01 s — canonical cadence
 ```
 
 When stopping:
-1. Flush remaining queued audio.
-2. Call `conn.input_audio_buffer.commit()` so the server finalizes any in-flight segment.
+1. Flush any remaining queued audio (same append pattern).
+2. Call `conn.input_audio_buffer.commit()` to force finalize any in-flight segment.
 3. Cancel pending tasks via `asyncio.wait(FIRST_COMPLETED)` + cancel.
 
 ### Threading model
 
-- `StreamTranscriber` owns its own thread running `asyncio.run(_stream_session())`.
-- Cross-thread interaction is `send_audio(pcm_bytes)` → a `queue.Queue` — thread-safe.
-- Never call `on_text` synchronously from the UI thread. The recorder dispatches via `window.after(0, lambda: widget.append_caption(text))`.
+- `TranscriptionService` owns a dedicated thread running `asyncio.run(self._run_ws_loop())`.
+- Cross-thread interaction is `stream_send_audio(pcm_bytes)` → `queue.Queue` — thread-safe.
+- Deltas/completions arrive on the WS thread and MUST be marshalled to T1 before they touch CTk — in this project, the orchestrator wires `on_delta`/`on_completed` as `lambda text: window.dispatch(lambda: caption_router.on_delta(text))`.
+
+### Regression probe
+
+`tools/probe_lemonade_ws.py` streams `tests/fixtures/sample_meeting.wav` directly to Lemonade's WS using the canonical pattern. Run it after any change to `transcription.py` that touches the WS path:
+
+```bash
+python tools/probe_lemonade_ws.py --session-update none
+```
+
+Expected: event counts include `input_audio_buffer.speech_started`, `.committed`, `conversation.item.input_audio_transcription.delta`, `.completed` with nonzero counts. If only `session.updated` fires and nothing else, you've re-introduced one of the bugs above.
 
 ---
 
@@ -241,6 +265,8 @@ The `save_transcript` method writes this format. Obsidian parses the YAML frontm
 | Streaming connects but `session.created` never arrives | Port mismatch — tried 9000 while server uses a different port | Always call `_get_ws_port()` before connecting |
 | Logs show only `{'session.updated': 1}` in `[STREAM] Event-type counts:` at end of a real speech session | OpenAI-shaped `session.update` was sent; Lemonade accepted it but silently ignored it; VAD never fired | Remove the `session.update` call entirely (Approach A2). See Critical Rule 8 and the "Session setup — Approach A2" section above. |
 | `delta` events arrive but no `completed` events | Server saw audio but never hit a VAD boundary (silence) | Call `input_audio_buffer.commit()` on stop |
+| `session.created` arrives but **nothing else**, audio RMS clearly > threshold | Stream sink wiring broken → queue is empty (old `set_stream_sink` bug) OR `_send_loop` is batching chunks instead of per-chunk sends | Check `[STREAM] Sent N chunks` debug log fires. If zero, sink isn't wired — verify `RecordingService._pending_stream_sink` flow. If nonzero but VAD still silent, confirm per-chunk `input_audio_buffer.append` calls at ~10 ms cadence |
+| Only `session.updated` in `[STREAM] Event-type counts`, zero `.delta`/`.completed` during real speech | OpenAI-shaped `session.update` payload silently disables VAD | Remove `session.update` entirely (canonical) OR use the flat Lemonade schema. Verify with `tools/probe_lemonade_ws.py` |
 | NPU driver crashes under load | Thermal throttling or driver bug | Connection-drop retry handles one recovery; beyond that, reboot |
 
 ---

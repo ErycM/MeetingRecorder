@@ -61,7 +61,7 @@ MODEL_LOAD_TIMEOUT = 120  # seconds
 MAX_CHUNK_BYTES = 24 * 1024 * 1024
 
 # Audio send interval for the streaming path
-SEND_INTERVAL = 0.1  # seconds between queue-drain ticks
+SEND_INTERVAL = 0.01  # seconds between audio-queue reads (match canonical)
 
 
 # ---------------------------------------------------------------------------
@@ -611,11 +611,14 @@ class TranscriptionService:
                 # format (PCM16 LE mono 16 kHz) and VAD (threshold 0.01,
                 # silence_duration_ms 800, prefix_padding_ms 250) already match our
                 # recorder output verbatim. Sending an OpenAI-shaped session.update
-                # (with input_audio_format, input_audio_transcription, or
-                # turn_detection.type) is silently accepted by the SDK but silently
-                # ignored by Lemonade, causing zero transcription events for the whole
-                # session. See Critical Rule 8 and .claude/kb/lemonade-whisper-npu.md
-                # "Session setup — Approach A2 (defaults-only)".
+                # is silently accepted by the SDK but silently ignored by Lemonade,
+                # causing zero transcription events. See Critical Rule 8 and
+                # .claude/kb/lemonade-whisper-npu.md "Session setup — Approach A2".
+                #
+                # VERIFIED via tools/probe_lemonade_ws.py on 2026-04-17 that the
+                # canonical pattern produces input_audio_buffer.speech_started +
+                # transcription.delta/.completed events as expected. DO NOT
+                # re-introduce session.update without re-running the probe.
 
                 sender = asyncio.create_task(self._send_loop(conn))
                 receiver = asyncio.create_task(self._receive_loop(conn))
@@ -640,26 +643,65 @@ class TranscriptionService:
                 self._on_error(exc)
 
     async def _send_loop(self, conn: object) -> None:
-        """Drain the audio queue and send chunks to WebSocket."""
+        """Send each PCM chunk to the WebSocket as it arrives.
+
+        Matches the canonical Lemonade realtime_transcription.py pattern: one
+        ``input_audio_buffer.append`` call per chunk, with a tight ~10 ms
+        sleep between iterations. Earlier versions batched chunks every 100 ms
+        into a single large append, which appeared to starve Lemonade's VAD
+        and produced zero transcription events (see probe tool).
+
+        Chunks arrive from ``audio_recorder`` at ~100 ms cadence (16 kHz
+        mono PCM16, 3200 bytes each). A fast inner loop plus short sleep keeps
+        the WebSocket fed with a steady stream without burning CPU when the
+        queue is empty.
+        """
+        total_bytes = 0
+        chunk_count = 0
+        last_report = 0
+        import time as _time
+
+        start = _time.monotonic()
         while self._stream_running:
-            chunks: list[bytes] = []
+            try:
+                chunk = self._audio_queue.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(SEND_INTERVAL)
+                continue
 
-            while not self._audio_queue.empty():
-                try:
-                    chunks.append(self._audio_queue.get_nowait())
-                except queue.Empty:
-                    break
+            encoded = base64.b64encode(chunk).decode("ascii")
+            try:
+                await conn.input_audio_buffer.append(audio=encoded)
+            except Exception as exc:
+                log.error("[STREAM] Send error: %s", exc)
+                break
 
-            if chunks:
-                combined = b"".join(chunks)
-                encoded = base64.b64encode(combined).decode("ascii")
-                try:
-                    await conn.input_audio_buffer.append(audio=encoded)
-                except Exception as exc:
-                    log.error("[STREAM] Send error: %s", exc)
-                    break
+            total_bytes += len(chunk)
+            chunk_count += 1
 
+            # Diagnostic: log progress every ~5 seconds at DEBUG level so
+            # it stays out of the default INFO log but is available during
+            # streaming-pipeline debugging (raise log level in main.py or
+            # via LOGLEVEL env if you need it).
+            elapsed = _time.monotonic() - start
+            if elapsed - last_report >= 5.0:
+                log.debug(
+                    "[STREAM] Sent %d chunks (%d bytes = %.1fs of PCM16 @ 16kHz) over %.1fs wall",
+                    chunk_count,
+                    total_bytes,
+                    total_bytes / 2 / 16000,
+                    elapsed,
+                )
+                last_report = elapsed
+
+            # Tight sleep — matches canonical's asyncio.sleep(0.01) between sends.
             await asyncio.sleep(SEND_INTERVAL)
+
+        log.info(
+            "[STREAM] _send_loop exiting: %d chunks, %d bytes total",
+            chunk_count,
+            total_bytes,
+        )
 
         # Flush remaining audio after stop signal
         while not self._audio_queue.empty():
@@ -730,10 +772,11 @@ class TranscriptionService:
                     # for diagnostics, but no routing action needed.
                     pass
                 else:
-                    # Surface unknown event types at INFO (only the first
-                    # occurrence of each type) so we can adapt the handler.
-                    if event_counts[etype] == 1:
-                        log.info("[STREAM] Unhandled event type: %s", etype)
+                    # Surface EVERY non-delta event so we can see VAD fire-ups
+                    # (speech_started, committed, speech_stopped) mid-session
+                    # when debugging. Deltas are deliberately left silent —
+                    # they arrive at caption-rate and would spam the log.
+                    log.info("[STREAM] event: %s", etype)
         except asyncio.CancelledError:
             pass
         except Exception as exc:

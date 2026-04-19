@@ -191,6 +191,7 @@ class RecordingService:
         from audio_recorder import DualAudioRecorder
 
         self._recorder = DualAudioRecorder()
+
         self._wav_path = Path(wav_path)
         self._start_time = time.time()
 

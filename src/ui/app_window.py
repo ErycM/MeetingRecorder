@@ -64,7 +64,9 @@ class AppWindow:
         config: object,
         history_index: object,
         *,
-        on_stop: Callable[[], None],
+        on_stop: Callable[[], None] | None = None,
+        on_toggle_recording: Callable[[], None] | None = None,
+        get_last_save_result: Callable[[], object] | None = None,
         on_save_config: Callable[[object], None],
         on_retry_npu: Callable[[], None] | None = None,
         on_quit: Callable[[], None] | None = None,
@@ -76,6 +78,7 @@ class AppWindow:
 
         self._on_quit = on_quit
         self._config = config
+        self._get_last_save_result = get_last_save_result
 
         # Build the main CTk window
         self._root = ctk.CTk()
@@ -100,11 +103,15 @@ class AppWindow:
         from ui.history_tab import HistoryTab
         from ui.settings_tab import SettingsTab
 
+        # on_toggle_recording takes precedence; on_stop is the deprecated alias
+        _toggle_cb = on_toggle_recording or on_stop
         self._live_tab = LiveTab(
             tab_live,
+            on_toggle_recording=_toggle_cb,
             on_stop=on_stop,
             on_dismiss_capture_warning=on_dismiss_capture_warning,
             on_open_settings=lambda: self.switch_tab("Settings"),
+            root=self._root,
         )
         self._history_tab = HistoryTab(
             tab_history,
@@ -192,6 +199,8 @@ class AppWindow:
         Automatically selects the Live tab when RECORDING begins.
         Shows an error banner across all tabs when ERROR is entered.
         Clears captions at the start of each session.
+        Updates the dual-purpose button via apply_app_state(new).
+        Shows a toast on SAVING→IDLE; hides any toast on entry to RECORDING.
         """
         from app.state import AppState
 
@@ -205,6 +214,8 @@ class AppWindow:
             self._live_tab.clear_captions()
             self._live_tab.set_recording(True)
             self._live_tab.set_status("Recording...")
+            # SC-5: hide any lingering toast when a new session begins
+            self._live_tab._hide_toast()
 
         elif new is AppState.SAVING:
             self._live_tab.set_recording(False)
@@ -216,6 +227,14 @@ class AppWindow:
 
         elif new is AppState.IDLE:
             self._live_tab.set_recording(False)
+            # SAVING→IDLE edge: show the toast if a save result was published
+            if old is AppState.SAVING and self._get_last_save_result is not None:
+                try:
+                    result = self._get_last_save_result()
+                    if result is not None:
+                        self._live_tab.show_toast(result.kind, result.text)
+                except Exception as exc:
+                    log.warning("[APP_WINDOW] show_toast on IDLE failed: %s", exc)
 
         elif new is AppState.ERROR:
             reason_name = reason.name if reason is not None else "UNKNOWN"
@@ -228,6 +247,12 @@ class AppWindow:
             if reason is ErrorReason.LEMONADE_UNREACHABLE:
                 self._live_tab.show_lemonade_banner()
             log.error("[APP_WINDOW] Entered ERROR state: %s", reason_name)
+
+        # Always sync the button label+state to the new AppState (ADR-3)
+        try:
+            self._live_tab.apply_app_state(new)
+        except Exception as exc:
+            log.warning("[APP_WINDOW] apply_app_state failed: %s", exc)
 
         if new is not AppState.ERROR:
             self._settings_tab.set_error_banner(None)

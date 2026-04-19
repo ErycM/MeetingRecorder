@@ -140,6 +140,44 @@ def _read_lockfile_exclusion() -> str:
     return os.path.basename(sys.executable)
 
 
+# ---------------------------------------------------------------------------
+# Toast result types (ADR-1)
+# ---------------------------------------------------------------------------
+
+
+class ToastKind:
+    """String constants for toast variant kinds.
+
+    Using a plain class rather than Enum so callers can compare with string
+    literals without importing the enum — keeps AppWindow wiring simple.
+    """
+
+    SUCCESS = "success"
+    ERROR = "error"
+    NEUTRAL = "neutral"
+
+
+class LastSaveResult:
+    """Immutable record of the most recent save attempt.
+
+    Written by the orchestrator on T1 BEFORE driving SAVING → IDLE.
+    Read by AppWindow.on_state on the same edge, also on T1 — no locking.
+
+    Parameters
+    ----------
+    kind:
+        One of ``ToastKind.SUCCESS``, ``ToastKind.ERROR``, ``ToastKind.NEUTRAL``.
+    text:
+        Human-readable banner text (filename basename or failure reason).
+    """
+
+    __slots__ = ("kind", "text")
+
+    def __init__(self, kind: str, text: str) -> None:
+        self.kind = kind
+        self.text = text
+
+
 class Orchestrator:
     """Slim orchestrator: wires services + state machine + UI.
 
@@ -188,6 +226,10 @@ class Orchestrator:
         self._consecutive_silent_filtered: int = 0
         self._capture_warning_active: bool = False
 
+        # Last save result — written on T1 just before SAVING→IDLE transition;
+        # read by AppWindow.on_state on the same edge (also T1). No locking.
+        self._last_save_result: LastSaveResult | None = None
+
         # Load history from disk
         try:
             self._history_index.load()
@@ -219,6 +261,8 @@ class Orchestrator:
             config=self._config,
             history_index=self._history_index,
             on_stop=self._on_stop_button,
+            on_toggle_recording=self.toggle_recording,
+            get_last_save_result=self.get_last_save_result,
             on_save_config=self._on_config_saved,
             on_retry_npu=self._on_retry_npu,
             on_quit=self._on_quit,
@@ -278,7 +322,7 @@ class Orchestrator:
         self._tray_svc = TrayService(
             icon_path=self._icon_path,
             on_show_window=lambda: dispatch(self._window.show),  # type: ignore[attr-defined]
-            on_toggle_record=lambda: dispatch(self._on_tray_toggle),
+            on_toggle_record=lambda: dispatch(self.toggle_recording),
             on_quit=lambda: dispatch(self._on_quit),
             dispatch=dispatch,
         )
@@ -583,9 +627,11 @@ class Orchestrator:
             )
         except Exception as exc:
             log.error("[ORCH] Save transcript failed: %s", exc)
-            msg = f"Save failed: {exc}"
+            reason = str(exc)[:80]
             self._window.dispatch(  # type: ignore[attr-defined]
-                lambda m=msg: self._window.live_tab.set_status(m)  # type: ignore[attr-defined]
+                lambda r=reason: self._publish_save_result(
+                    ToastKind.ERROR, f"Save failed: {r}"
+                )
             )
             self._window.dispatch(self._transition_to_armed)  # type: ignore[attr-defined]
 
@@ -625,15 +671,22 @@ class Orchestrator:
                     wav_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                dur_s = int(duration_s)
+                dur_str = f"{dur_s // 60}:{dur_s % 60:02d}"
                 self._window.dispatch(  # type: ignore[attr-defined]
-                    lambda: self._window.live_tab.set_status("Recording too short")  # type: ignore[attr-defined]
+                    lambda d=dur_str: self._publish_save_result(
+                        ToastKind.NEUTRAL,
+                        f"Recording finished ({d}) \u2014 no speech detected",
+                    )
                 )
                 self._window.dispatch(self._transition_to_armed)  # type: ignore[attr-defined]
         except Exception as exc:
             log.error("[ORCH] Batch transcription failed: %s", exc)
-            msg = f"Transcription failed: {exc}"
+            reason = str(exc)[:80]
             self._window.dispatch(  # type: ignore[attr-defined]
-                lambda m=msg: self._window.live_tab.set_status(m)  # type: ignore[attr-defined]
+                lambda r=reason: self._publish_save_result(
+                    ToastKind.ERROR, f"Transcription failed: {r}"
+                )
             )
             self._window.dispatch(self._transition_to_armed)  # type: ignore[attr-defined]
 
@@ -669,6 +722,11 @@ class Orchestrator:
 
         self._window.live_tab.set_saved_path(md_path)  # type: ignore[attr-defined]
         log.info("[ORCH] Transcript saved: %s", md_path.name)
+        # Publish success toast result BEFORE _transition_to_armed so that
+        # AppWindow.on_state sees it on the SAVING→IDLE edge (ADR-1).
+        self._publish_save_result(
+            ToastKind.SUCCESS, f"Recording saved \u2192 {md_path.name}"
+        )
         # Clean capture — reset the safety-net counter and clear any banner
         # the user may have left up from a previous misconfiguration.
         self._consecutive_silent_filtered = 0
@@ -679,6 +737,15 @@ class Orchestrator:
             except Exception as exc:
                 log.debug("[ORCH] hide_capture_warning failed: %s", exc)
         self._transition_to_armed()
+
+    def _publish_save_result(self, kind: str, text: str) -> None:
+        """Store a LastSaveResult on T1 so AppWindow can read it on SAVING→IDLE.
+
+        Must be called on T1 (either directly in _on_save_complete, or via
+        dispatch in worker-thread paths) — no locking needed (ADR-1, ADR-4).
+        """
+        self._last_save_result = LastSaveResult(kind=kind, text=text)
+        log.debug("[ORCH] _publish_save_result kind=%s text=%r", kind, text[:60])
 
     def _transition_to_armed(self) -> None:
         """SAVING → ARMED (back to waiting for mic). Called on T1.
@@ -731,22 +798,51 @@ class Orchestrator:
             log.warning("[ORCH] post-rearm mic-active check failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Public: shared Start/Stop entry point (ADR-2)
+    # ------------------------------------------------------------------
+
+    def toggle_recording(self) -> None:
+        """Single shared entry point for the Live tab button and tray toggle.
+
+        Routes to ``_start_recording()`` or ``_stop_recording()`` based on
+        the current state.  Illegal clicks (TRANSCRIBING / SAVING / ERROR)
+        are swallowed with a debug log — never raised (SC-9).
+
+        Must be called on T1.
+        """
+        from app.state import AppState
+
+        current = self._sm.current
+        if current in (AppState.IDLE, AppState.ARMED):
+            log.debug("[ORCH] toggle_recording: starting from %s", current.name)
+            self._start_recording()
+        elif current is AppState.RECORDING:
+            log.debug("[ORCH] toggle_recording: stopping from RECORDING")
+            self._stop_recording()
+        else:
+            log.debug("[ORCH] toggle_recording: no-op in state %s", current.name)
+
+    def get_last_save_result(self) -> "LastSaveResult | None":
+        """Return the most recent save result, or None if not yet set.
+
+        Read by AppWindow.on_state on the SAVING→IDLE edge (T1).
+        """
+        return self._last_save_result
+
+    # ------------------------------------------------------------------
     # Button / hotkey / tray callbacks — all on T1
     # ------------------------------------------------------------------
 
     def _on_stop_button(self) -> None:
-        """Stop button on Live tab — manual stop."""
+        """Back-compat shim — delegates to toggle_recording."""
         from app.state import AppState
 
         if self._sm.current is AppState.RECORDING:
             self._stop_recording()
 
     def _on_tray_toggle(self) -> None:
-        """Tray Start/Stop toggle — only acts when RECORDING."""
-        from app.state import AppState
-
-        if self._sm.current is AppState.RECORDING:
-            self._stop_recording()
+        """Back-compat shim — delegates to toggle_recording."""
+        self.toggle_recording()
 
     def _on_hotkey_stop(self) -> None:
         """Global hotkey 'stop & save now' — same as stop button."""

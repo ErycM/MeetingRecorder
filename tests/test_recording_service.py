@@ -202,6 +202,58 @@ class TestStartStop:
 
         assert stop_order.index("clear_callback") < stop_order.index("recorder.stop")
 
+    def test_set_stream_sink_before_start_applies_on_start(
+        self, fake_recorder, tmp_path
+    ):
+        """Regression: set_stream_sink() BEFORE start() must reach the new recorder.
+
+        This was the 'live captions panel empty' bug — the old guard in
+        set_stream_sink() silently no-op'd when ``self._recorder is None``,
+        so the streaming callback was dropped. DualAudioRecorder was then
+        created with ``_on_audio_chunk = None``, TranscriptionService's
+        queue stayed empty, and Lemonade never saw any audio — producing
+        zero transcription events despite clean WAV capture.
+
+        The fix stores the pending callback and applies it inside start()
+        right after the new DualAudioRecorder is constructed.
+        """
+        from app.services.recording import RecordingService
+
+        captured: list[bytes] = []
+
+        def sink(pcm: bytes) -> None:
+            captured.append(pcm)
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            # Wire sink BEFORE start — mirrors orchestrator._start_recording()
+            svc.set_stream_sink(sink)
+            svc.start(tmp_path / "out.wav")
+
+            # Callback must have been applied to the new recorder
+            assert fake_recorder._on_audio_chunk is sink
+
+            # Simulate the recorder firing a chunk → sink must receive it
+            fake_recorder._on_audio_chunk(b"\x00\x01" * 100)
+            svc.stop()
+
+        assert captured == [b"\x00\x01" * 100]
+
+    def test_set_stream_sink_after_start_applies_live(self, fake_recorder, tmp_path):
+        """set_stream_sink() AFTER start() applies immediately to the live recorder."""
+        from app.services.recording import RecordingService
+
+        def sink(pcm: bytes) -> None:
+            pass
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            assert fake_recorder._on_audio_chunk is None
+            svc.set_stream_sink(sink)
+            assert fake_recorder._on_audio_chunk is sink
+            svc.stop()
+
 
 # ---------------------------------------------------------------------------
 # Stream-sink wiring tests (regression guard for the zero-events bug)
