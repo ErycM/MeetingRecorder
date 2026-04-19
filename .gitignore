@@ -13,3 +13,5 @@ installer_output/
 # Claude Code local state
 .claude/settings.local.json
 .claude/worktrees/
+.codex/
+.Codex/
