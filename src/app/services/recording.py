@@ -97,6 +97,10 @@ class RecordingService:
 
         # Lazily imported so this module stays importable on non-Windows
         self._recorder: object | None = None
+        # Buffered stream sink: set_stream_sink() may be called before
+        # start() (the orchestrator wires the callback first); store it
+        # here and apply inside start() once the recorder exists.
+        self._stream_sink: Callable[[bytes], None] | None = None
         self._wav_path: Path | None = None
         self._start_time: float = 0.0
 
@@ -140,11 +144,16 @@ class RecordingService:
             return "", ""
 
     def set_stream_sink(self, callback: Callable[[bytes], None] | None) -> None:
-        """Wire (or clear) the streaming audio chunk callback on the recorder.
+        """Store the streaming audio chunk callback and apply it if a
+        recorder is already running.
 
-        Called by the orchestrator to connect/disconnect TranscriptionService.
-        Setting to None must happen BEFORE stop() per invariant I-5.
+        Safe to call before ``start()``: the callback is buffered and
+        applied to the ``DualAudioRecorder`` inside ``start()`` as soon as
+        the recorder is instantiated.  Safe to call mid-recording to swap
+        sinks.  Calling with ``None`` clears both the buffer and the live
+        callback — ``stop()`` relies on this for invariant I-5.
         """
+        self._stream_sink = callback
         if self._recorder is not None:
             self._recorder.set_audio_chunk_callback(callback)  # type: ignore[attr-defined]
 
@@ -191,6 +200,15 @@ class RecordingService:
             mic_device_index=mic_device_index,
             loopback_device_index=loopback_device_index,
         )
+
+        # Apply any stream sink wired before start() — fixes the
+        # "zero-events" bug where the orchestrator called
+        # set_stream_sink() before start() and the callback was silently
+        # dropped because self._recorder was still None.
+        if self._stream_sink is not None:
+            self._recorder.set_audio_chunk_callback(  # type: ignore[attr-defined]
+                self._stream_sink
+            )
 
         # Start silence-timeout checker
         self._silence_stop_event.clear()
@@ -274,8 +292,15 @@ class RecordingService:
                     secs,
                     self._silence_timeout_s,
                 )
-                # Notify then auto-stop — both dispatched to T1
+                # If a handler is wired, the caller owns the stop
+                # transition (the orchestrator drives the state machine
+                # through _stop_recording()).  Dispatching stop() here
+                # too would cause a redundant "stop() called but not
+                # recording — ignoring" warning once the caller's stop
+                # path has already completed.  When no handler is wired
+                # (tests, standalone use), fall back to auto-stopping.
                 if self._on_silence_detected is not None:
                     self._dispatch(self._on_silence_detected)
-                self._dispatch(self.stop)
+                else:
+                    self._dispatch(self.stop)
                 break

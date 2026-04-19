@@ -60,6 +60,36 @@ for i in range(pa.get_device_count()):
 
 ---
 
+## Device selection and user overrides
+
+The Windows default input device is not always the device that actually captures audio — Bluetooth dongles, headsets in A2DP mode, and systems where the meeting app has its own mic preference (Zoom, Chrome WebRTC) routinely leave the Windows default silent. The recorder supports two optional `Config` overrides, plus a dropdown enumeration helper for the Settings UI.
+
+### Config fields
+
+`Config.mic_device_index` and `Config.loopback_device_index` (`src/app/config.py:104-105`) are `int | None`. `None` means "use the Windows default" (historic behaviour). A non-None value pins a specific PyAudio device index.
+
+Validation at `src/app/config.py:115-122` rejects negative indices. TOML round-trip only writes the keys when non-None, so default configs stay minimal.
+
+### Resolution helpers
+
+`_resolve_mic_device(pa, override_index)` (`src/audio_recorder.py:54`) and `_resolve_loopback_device(pa, override_index)` (`src/audio_recorder.py:83`) are the single entry points `DualAudioRecorder.start()` uses:
+
+- `None` override → existing auto path (`pa.get_default_input_device_info()` for mic, `_find_loopback_device(pa)` for loopback)
+- Valid override → return that device
+- Missing / wrong-type override → fall back with `log.warning("[AUDIO] … — using Windows default")` so the recording still starts on *something*
+
+### Enumerating for the UI
+
+`list_input_devices()` at `src/audio_recorder.py:112` is the only sanctioned way to build a dropdown of pickable devices. It:
+
+1. Filters to the WASAPI host API (`pa.get_host_api_info_by_type(pyaudio.paWASAPI)`). The same physical mic otherwise shows up 3+ times — once per host API (MME, DirectSound, WASAPI) — and MME truncates names to 31 chars, so non-WASAPI indices are both duplicate *and* unreliable to persist.
+2. Dedupes within WASAPI by `(name, is_loopback)` tuple.
+3. Returns `[{index, name, is_loopback, max_channels, rate}, ...]` — safe to persist any of these indices into `Config`.
+
+**Rule**: any new code that persists a PyAudio device index must source it from `list_input_devices()` or an equivalent WASAPI-filtered enumeration. Raw `PyAudio.get_device_count()` loops produce indices that can point to the wrong device after a driver reinstall.
+
+---
+
 ## Sample rates, channels, bit depth
 
 | Source | Rate | Channels | Bit depth |
@@ -124,6 +154,34 @@ pcm = (mixed * 32767).astype(np.int16)
 We track `self._last_audio_time` during mixing. If the RMS of the mixed buffer exceeds `SILENCE_RMS_THRESHOLD = 0.005`, we bump the timestamp. `main.py` polls `recorder.seconds_since_audio` every 10 s and auto-stops after `SILENCE_TIMEOUT = 180 s`.
 
 Threshold rationale: 0.005 is ~ -46 dBFS. Below that is reliably background noise (keyboard, fan). Above it is speech or music. Tuning up risks cutting during quiet speakers; down risks never stopping.
+
+---
+
+## Silent-capture diagnostics
+
+Silence detection above drives auto-stop. A second layer of instrumentation exists for when capture is *unexpectedly* silent — e.g. the user's Windows default mic points at a dead Bluetooth A2DP endpoint during a real call.
+
+### Audio-level heartbeat
+
+The writer loop emits `[AUDIO] level mic=<mic_rms> loop=<loop_rms> mixed=<mixed_rms> (>0.0050=active)` every 5 seconds (50 × 100 ms chunks). Grepping this line in `logs/recorder.log` answers "was anything actually coming in?" without needing a rerun — it distinguishes:
+
+- All three zero → endpoint is dead (wrong device picked, or exclusive-mode lockout by another app)
+- `loop` non-zero, `mic` zero → system audio captured, but user's mic silent (Whisper can still transcribe the other speaker)
+- `mic` non-zero → normal capture
+
+### Peak-level accessor
+
+`DualAudioRecorder.get_last_peak_level()` at `src/audio_recorder.py:366` returns the peak mixed-RMS observed during the current (or most recent) recording. `_peak_level` is written by the writer thread on the same loop that updates `_last_audio_time`; it's a plain float so reads from T1 are safe after the recorder stops. The orchestrator uses this to tell "Whisper hallucinated on real quiet audio" (non-zero peak) apart from "audio stream delivered literal zeros" (peak < `_SILENT_PEAK_THRESHOLD`, 0.005 in `src/app/orchestrator.py:73` — kept in sync with `SILENCE_RMS_THRESHOLD`).
+
+### Device-name accessor
+
+`get_last_device_names()` at `src/audio_recorder.py:376` returns `(mic_name, loopback_name)` from the most recent `start()`. Used by the orchestrator's capture-warning banner so the user sees the actual endpoint that went silent — names are more durable than indices across driver reinstalls.
+
+### Silent-loop safety net (orchestrator-level)
+
+The orchestrator tracks `_consecutive_silent_filtered` recordings (`src/app/orchestrator.py`). After `_SILENT_LOOP_LIMIT = 4` consecutive cycles where each recording was filtered as a hallucination **and** its peak was below `_SILENT_PEAK_THRESHOLD`, it pauses auto-rearm and shows a capture-warning banner in the Live tab. At the default 30 s silence-autostop that's ~2 minutes of pure dead air before we assume the endpoint is wrong rather than the meeting being quiet.
+
+Tuning rationale for `_SILENT_LOOP_LIMIT = 4`: meetings routinely have natural 30–60 s quiet stretches (someone sharing a screen, everyone on mute). Lower values false-trigger on those; higher values delay the feedback when capture is genuinely broken.
 
 ---
 

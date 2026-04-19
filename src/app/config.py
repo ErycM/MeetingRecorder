@@ -48,7 +48,7 @@ CONFIG_PATH: Path = _default_config_path()
 # was an invalid ID on current Lemonade installs (2026) which use capitalised
 # names like "Whisper-Large-v3-Turbo". Must also appear in npu_guard.NPU_ALLOWLIST.
 _DEFAULT_WHISPER_MODEL = "Whisper-Large-v3-Turbo"
-_DEFAULT_SILENCE_TIMEOUT = 30
+_DEFAULT_SILENCE_TIMEOUT = 120  # seconds (2 minutes)
 _DEFAULT_HOTKEY: str | None = None
 
 
@@ -103,6 +103,11 @@ class Config:
     # mics need to pin an endpoint here to avoid capturing silence during calls.
     mic_device_index: int | None = None
     loopback_device_index: int | None = None
+    # Lemonade REST base URL. "http://localhost:13305" is the default ship
+    # port (matches transcription.LEMONADE_URL). Users whose Lemonade listens
+    # on a non-default port or a remote host override it here; Settings tab
+    # exposes the field and a reachability probe.
+    lemonade_base_url: str = "http://localhost:13305"
 
     # Internal: path this config was loaded from (not serialised)
     _source_path: Path | None = field(default=None, repr=False, compare=False)
@@ -120,6 +125,11 @@ class Config:
             raise ConfigError(
                 f"loopback_device_index must be >= 0 or None, "
                 f"got {self.loopback_device_index}"
+            )
+        url = self.lemonade_base_url.strip()
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            raise ConfigError(
+                f"lemonade_base_url must start with http:// or https://, got {url!r}"
             )
 
 
@@ -160,6 +170,9 @@ def load(path: Path | None = None) -> Config:
             loopback_device_index=_coerce_optional_int(
                 data.get("loopback_device_index"), field_name="loopback_device_index"
             ),
+            lemonade_base_url=str(
+                data.get("lemonade_base_url", "http://localhost:13305")
+            ),
             _source_path=resolved,
         )
     except ConfigError:
@@ -196,6 +209,7 @@ def save(cfg: Config, path: Path | None = None) -> None:
         data["mic_device_index"] = int(cfg.mic_device_index)
     if cfg.loopback_device_index is not None:
         data["loopback_device_index"] = int(cfg.loopback_device_index)
+    data["lemonade_base_url"] = cfg.lemonade_base_url
 
     # Atomic write: temp file in same directory → os.replace
     rand_suffix = secrets.token_hex(4)

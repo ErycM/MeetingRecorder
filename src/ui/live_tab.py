@@ -52,17 +52,46 @@ class LiveTab:
         parent: object,
         on_stop: Callable[[], None],
         on_dismiss_capture_warning: Callable[[], None] | None = None,
+        on_open_settings: Callable[[], None] | None = None,
     ) -> None:
         import customtkinter as ctk
         from ui import theme
 
         self._on_stop = on_stop
         self._on_dismiss_capture_warning = on_dismiss_capture_warning
+        self._on_open_settings = on_open_settings
         self._is_recording = False
 
         # Outer frame fills the tab
         self.frame = ctk.CTkFrame(parent)
         self.frame.pack(fill="both", expand=True, padx=theme.PAD_X, pady=theme.PAD_Y)
+
+        # Lemonade-missing banner — hidden by default. Shown when orchestrator
+        # enters AppState.ERROR with ErrorReason.LEMONADE_UNREACHABLE. Dismissable;
+        # state-machine drives re-display on next probe failure.
+        self._lemonade_banner_frame = ctk.CTkFrame(
+            self.frame, fg_color="#2a3a5a", corner_radius=6
+        )
+        self._lemonade_banner_label = ctk.CTkLabel(
+            self._lemonade_banner_frame,
+            text="Lemonade Server not reachable",
+            anchor="w",
+            justify="left",
+            font=theme.FONT_STATUS,
+            wraplength=420,
+        )
+        self._lemonade_banner_label.pack(
+            side="left", fill="x", expand=True, padx=theme.PAD_INNER, pady=4
+        )
+        self._lemonade_open_settings_btn = ctk.CTkButton(
+            self._lemonade_banner_frame,
+            text="Open Settings",
+            width=120,
+            command=self._on_open_settings_clicked,
+        )
+        self._lemonade_open_settings_btn.pack(
+            side="right", padx=theme.PAD_INNER, pady=4
+        )
 
         # Capture-warning banner — hidden by default. Shown when the
         # orchestrator detects consecutive silent recordings (wrong audio
@@ -195,6 +224,26 @@ class LiveTab:
         self._text.mark_set(_PARTIAL_MARK_START, "end")
         self._text.mark_set(_PARTIAL_MARK_END, "end")
         self._text.config(state="disabled")
+
+    def show_lemonade_banner(self) -> None:
+        """Show the Lemonade-unreachable banner. MUST be on T1."""
+        self._lemonade_banner_frame.pack(
+            fill="x", padx=0, pady=(0, 4), before=self._timer_label
+        )
+
+    def hide_lemonade_banner(self) -> None:
+        """Hide the banner. Idempotent. MUST be on T1."""
+        try:
+            self._lemonade_banner_frame.pack_forget()
+        except Exception:
+            pass
+
+    def _on_open_settings_clicked(self) -> None:
+        if self._on_open_settings is not None:
+            try:
+                self._on_open_settings()
+            except Exception as exc:
+                log.warning("[LIVE] on_open_settings callback raised: %s", exc)
 
     def show_capture_warning(self, mic_name: str, loopback_name: str) -> None:
         """Show the silent-capture banner naming the currently-selected devices.

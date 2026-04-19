@@ -4,16 +4,18 @@ SettingsTab — configuration form bound to Config.
 Fields (DEFINE §3):
 - Vault / save directory (folder picker, required)
 - WAV archive directory (folder picker, required)
+- Lemonade base URL override (text field)
 - Whisper model (dropdown, NPU-filtered)
 - Silence timeout seconds (spinner)
 - Launch on Windows login (toggle)
 - Global hotkey "stop & save now" (HotkeyCaptureFrame)
 - Live captions enabled (toggle)
 
-Diagnostics panel at bottom: NPU status, Lemonade URL, last error.
+Diagnostics panel at bottom: NPU status, Lemonade reachability, About row.
 
 Save button validates and writes via Config.save().
-Launch-on-login toggle calls install_startup.install()/uninstall().
+Launch-on-login toggle is informational when frozen (Inno manages startup
+shortcut via {userstartup} entry — ADR-4/ADR-12).
 
 Threading: all methods on T1. Model-list fetch is done on a worker thread
 by the orchestrator and passed in via set_available_models().
@@ -22,6 +24,8 @@ by the orchestrator and passed in via set_available_models().
 from __future__ import annotations
 
 import logging
+import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from typing import Callable
@@ -58,6 +62,7 @@ class SettingsTab:
         on_retry_npu: Callable[[], None] | None = None,
     ) -> None:
         import customtkinter as ctk
+        from app.__version__ import __version__
         from ui import theme
         from ui.hotkey_capture import HotkeyCaptureFrame
 
@@ -109,6 +114,19 @@ class SettingsTab:
             width=70,
             command=lambda: self._pick_folder(self._wav_var),
         ).grid(row=row, column=2, pady=4)
+        row += 1
+
+        # Lemonade base URL override
+        ctk.CTkLabel(scroll_frame, text="Lemonade URL:", anchor="w").grid(
+            row=row, column=0, sticky="w", padx=theme.PAD_INNER, pady=4
+        )
+        _lemonade_url_default = getattr(
+            config, "lemonade_base_url", "http://localhost:13305"
+        )
+        self._lemonade_url_var = tk.StringVar(value=_lemonade_url_default)
+        ctk.CTkEntry(scroll_frame, textvariable=self._lemonade_url_var, width=260).grid(
+            row=row, column=1, columnspan=2, padx=(0, 4), pady=4, sticky="w"
+        )
         row += 1
 
         # Whisper model dropdown
@@ -275,6 +293,16 @@ class SettingsTab:
         )
         self._diag_label.pack(fill="x", padx=theme.PAD_INNER, pady=(0, 4))
 
+        # Lemonade reachability row
+        self._lemonade_diag_label = ctk.CTkLabel(
+            diag_frame,
+            text="Lemonade: checking...",
+            anchor="w",
+            font=theme.FONT_STATUS,
+            justify="left",
+        )
+        self._lemonade_diag_label.pack(fill="x", padx=theme.PAD_INNER, pady=(0, 4))
+
         self._retry_btn = ctk.CTkButton(
             diag_frame,
             text="Retry NPU Check",
@@ -284,6 +312,14 @@ class SettingsTab:
         self._retry_btn.pack(
             anchor="w", padx=theme.PAD_INNER, pady=(0, theme.PAD_INNER)
         )
+
+        # About row
+        ctk.CTkLabel(
+            self.frame,
+            text=f"MeetingRecorder v{__version__}",
+            anchor="center",
+            font=theme.FONT_STATUS,
+        ).pack(pady=(4, theme.PAD_INNER))
 
     # ------------------------------------------------------------------
     # Public API — called from T1
@@ -313,6 +349,19 @@ class SettingsTab:
             self._diag_label.configure(text=f"ERROR: {error_text}")
         else:
             self._diag_label.configure(text="NPU: OK")
+
+    def set_lemonade_reachable(
+        self, ok: bool, detail: str = "", ts: str | None = None
+    ) -> None:
+        """Update the Lemonade reachability diagnostic row.
+
+        MUST be called from T1 (dispatch via AppWindow.dispatch).
+        """
+        stamp = ts or time.strftime("%H:%M:%S")
+        status = "OK" if ok else f"FAIL ({detail})"
+        self._lemonade_diag_label.configure(
+            text=f"Lemonade: {status}  (last probe {stamp})"
+        )
 
     # ------------------------------------------------------------------
     # Internal
@@ -407,6 +456,7 @@ class SettingsTab:
             global_hotkey=self._hotkey_capture.get(),
             mic_device_index=mic_idx,
             loopback_device_index=loop_idx,
+            lemonade_base_url=self._lemonade_url_var.get().strip(),
             _source_path=self._config._source_path if self._config else None,
         )
 
@@ -428,20 +478,21 @@ class SettingsTab:
             self._on_save(new_cfg)
 
     def _apply_login_toggle(self, enabled: bool) -> None:
-        """Call install_startup install/uninstall based on toggle state."""
-        try:
-            import install_startup
-
-            if enabled:
-                install_startup.install()
-            else:
-                install_startup.uninstall()
-        except ImportError:
-            log.warning(
-                "[SETTINGS] install_startup not importable — skipping login toggle"
+        """Launch-on-login is now managed by the Inno Setup installer's
+        {userstartup} entry (ADR-4/ADR-12). The Settings toggle is kept for
+        source-run developers only — it no longer mutates the registry
+        from the app. When frozen, the toggle state is informational.
+        """
+        if getattr(sys, "frozen", False):
+            log.info(
+                "[SETTINGS] launch_on_login=%s (Inno manages startup shortcut)",
+                enabled,
             )
-        except Exception as exc:
-            log.warning("[SETTINGS] Login toggle failed: %s", exc)
+            return
+        log.info(
+            "[SETTINGS] launch_on_login=%s — source-run dev may register HKCU\\Run manually",
+            enabled,
+        )
 
     def _on_retry(self) -> None:
         if self._on_retry_npu is not None:

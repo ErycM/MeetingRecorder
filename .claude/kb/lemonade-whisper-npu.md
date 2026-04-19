@@ -88,7 +88,7 @@ except requests.ConnectionError:
 
 ## WebSocket realtime API (live captions)
 
-Used by `StreamTranscriber` in `src/stream_transcriber.py`. Lemonade exposes an **OpenAI-compatible Realtime API** for streaming transcription.
+Used by `TranscriptionService` in `src/app/services/transcription.py`. Lemonade exposes an **OpenAI-SDK-compatible but Lemonade-schema-authoritative** Realtime API for streaming transcription. The OpenAI Python SDK speaks the wire protocol Lemonade implements, but the payload shapes inside that protocol differ — always cross-check against Lemonade's canonical example, not OpenAI docs (Critical Rule 8).
 
 ### Discovering the WebSocket port
 
@@ -116,13 +116,51 @@ async with client.beta.realtime.connect(model="Whisper-Large-v3-Turbo") as conn:
     # conn.input_audio_buffer.commit()
 ```
 
+### Session setup — Approach A2 (defaults-only)
+
+Canonical example: https://github.com/lemonade-sdk/lemonade/blob/main/examples/realtime_transcription.py
+
+Lemonade binds the model via the URL query string; the OpenAI SDK does this for us
+when we pass `model=` to `beta.realtime.connect`:
+
+```
+ws://localhost:<ws_port>/realtime?model=<ModelName>
+```
+
+**We do NOT call `conn.session.update(...)`.** Lemonade's defaults already match
+our recorder output:
+
+| Setting            | Lemonade default                                          |
+|--------------------|-----------------------------------------------------------|
+| Input audio format | PCM16 LE mono 16 kHz (our recorder writes this verbatim) |
+| turn_detection     | `{threshold: 0.01, silence_duration_ms: 800, prefix_padding_ms: 250}` — server VAD on by default |
+
+If a future feature ever needs to tune VAD, the Lemonade session schema is:
+
+```json
+{"type": "session.update",
+ "session": {"model": "<name>",
+             "turn_detection": {"threshold": 0.01,
+                                "silence_duration_ms": 800,
+                                "prefix_padding_ms": 250}}}
+```
+
+**Do not** send OpenAI-shaped keys (`input_audio_format`, `input_audio_transcription`,
+`turn_detection.type`) — Critical Rule 8. The OpenAI SDK will serialize them
+without error and Lemonade will silently ignore them, producing zero transcription
+events for the whole session. Only `{'session.updated': 1}` in the
+`[STREAM] Event-type counts:` log at end of a real speech session means the
+payload was wrong.
+
 ### Event types we handle
 
 | Event | Meaning | Action |
 |-------|---------|--------|
 | `session.created` | Connection ready | Log; begin sending audio |
-| `conversation.item.input_audio_transcription.delta` | Incremental text | Append to live widget (via `on_text(delta)`) |
-| `conversation.item.input_audio_transcription.completed` | Final text for a chunk | Append to `self._full_text` for the saved transcript |
+| `session.updated` | Session config acknowledged | Log at INFO (first occurrence); no action needed |
+| `input_audio_buffer.speech_started` | VAD detected speech onset | Log at INFO (first occurrence) |
+| `conversation.item.input_audio_transcription.delta` | Incremental text | Fire `on_delta` callback |
+| `conversation.item.input_audio_transcription.completed` | Final text for a segment | Append to `_full_text_segments`; fire `on_completed` |
 | `error` | Server-side error | Log and abort the receive loop |
 
 ### Sending audio
@@ -201,6 +239,7 @@ The `save_transcript` method writes this format. Obsidian parses the YAML frontm
 | Server starts but model never loads | Model not downloaded / wrong name | Download `Whisper-Large-v3-Turbo` via Lemonade UI; verify via `/api/v1/health → all_models_loaded` |
 | `requests.ReadTimeout` on transcription | 300 s default exceeded for very long chunks | Chunk at 10-minute boundaries (already implemented) |
 | Streaming connects but `session.created` never arrives | Port mismatch — tried 9000 while server uses a different port | Always call `_get_ws_port()` before connecting |
+| Logs show only `{'session.updated': 1}` in `[STREAM] Event-type counts:` at end of a real speech session | OpenAI-shaped `session.update` was sent; Lemonade accepted it but silently ignored it; VAD never fired | Remove the `session.update` call entirely (Approach A2). See Critical Rule 8 and the "Session setup — Approach A2" section above. |
 | `delta` events arrive but no `completed` events | Server saw audio but never hit a VAD boundary (silence) | Call `input_audio_buffer.commit()` on stop |
 | NPU driver crashes under load | Thermal throttling or driver bug | Connection-drop retry handles one recovery; beyond that, reboot |
 

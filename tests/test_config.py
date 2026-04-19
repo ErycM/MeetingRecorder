@@ -39,10 +39,15 @@ class TestConfigDefaults:
         assert cfg.vault_dir is None
         assert cfg.wav_dir is None
         assert cfg.whisper_model == "Whisper-Large-v3-Turbo"
-        assert cfg.silence_timeout == 30
+        assert cfg.silence_timeout == 120
         assert cfg.live_captions_enabled is True
         assert cfg.launch_on_login is False
         assert cfg.global_hotkey is None
+
+    def test_default_lemonade_base_url(self) -> None:
+        """Config() has the correct Lemonade default port (13305, not 8000)."""
+        cfg = Config()
+        assert cfg.lemonade_base_url == "http://localhost:13305"
 
     def test_default_config_is_valid(self) -> None:
         """Default Config() can be constructed without error."""
@@ -132,6 +137,31 @@ class TestConfigRoundTrip:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         assert data["whisper_model"] == "whisper-medium.en"
         assert data["silence_timeout"] == 20
+
+
+class TestLemonadeBaseUrl:
+    def test_roundtrip_lemonade_base_url(self, tmp_path: Path) -> None:
+        """lemonade_base_url survives a save/load cycle."""
+        path = _config_path(tmp_path)
+        cfg = Config(lemonade_base_url="https://remote.example:9443")
+        save(cfg, path=path)
+        loaded = load(path=path)
+        assert loaded.lemonade_base_url == "https://remote.example:9443"
+
+    def test_rejects_bare_host(self) -> None:
+        """Config with a bare host (no scheme) raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(lemonade_base_url="localhost:13305")
+
+    def test_rejects_empty_url(self) -> None:
+        """Config with an empty lemonade_base_url raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(lemonade_base_url="")
+
+    def test_accepts_https_url(self) -> None:
+        """https:// scheme is accepted."""
+        cfg = Config(lemonade_base_url="https://localhost:13305")
+        assert cfg.lemonade_base_url == "https://localhost:13305"
 
 
 class TestConfigErrors:

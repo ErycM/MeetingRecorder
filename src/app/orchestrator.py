@@ -250,6 +250,7 @@ class Orchestrator:
         # Build TranscriptionService
         server_exe = self._discover_server_exe()
         self._transcription_svc = TranscriptionService(
+            server_url=self._config.lemonade_base_url,
             model=self._config.whisper_model,
             server_exe=server_exe,
             on_error=lambda exc: dispatch(lambda: self._on_service_error(exc)),
@@ -328,9 +329,8 @@ class Orchestrator:
             available: list[str] = []
             try:
                 from app.npu_guard import list_npu_models
-                from app.services.transcription import LEMONADE_URL
 
-                available = list_npu_models(LEMONADE_URL)
+                available = list_npu_models(self._config.lemonade_base_url)
             except Exception as list_exc:
                 log.debug(
                     "[ORCH] Could not enumerate NPU models post-failure: %s", list_exc

@@ -68,6 +68,78 @@ def svc_factory(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# probe_only tests
+# ---------------------------------------------------------------------------
+
+
+class TestProbeOnly:
+    def test_probe_only_ok(self, svc_factory):
+        """probe_only() returns (True, '') when /health returns 200."""
+        svc = svc_factory()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch("requests.get", return_value=mock_resp):
+            ok, reason = svc.probe_only()
+        assert ok is True
+        assert reason == ""
+
+    def test_probe_only_non_200(self, svc_factory):
+        """probe_only() returns (False, 'http 503') on a non-200 status."""
+        svc = svc_factory()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        with patch("requests.get", return_value=mock_resp):
+            ok, reason = svc.probe_only()
+        assert ok is False
+        assert reason == "http 503"
+
+    def test_probe_only_timeout(self, svc_factory):
+        """probe_only() returns (False, 'timeout') on requests.Timeout."""
+        import requests as req
+
+        svc = svc_factory()
+        with patch("requests.get", side_effect=req.Timeout()):
+            ok, reason = svc.probe_only()
+        assert ok is False
+        assert reason == "timeout"
+
+    def test_probe_only_refused(self, svc_factory):
+        """probe_only() returns (False, 'connection refused') on ConnectionError."""
+        import requests as req
+
+        svc = svc_factory()
+        with patch("requests.get", side_effect=req.ConnectionError()):
+            ok, reason = svc.probe_only()
+        assert ok is False
+        assert reason == "connection refused"
+
+    def test_probe_only_does_not_start_server(self, svc_factory):
+        """probe_only() never calls _lemonade_start_server (Critical Rule #3)."""
+        import requests as req
+
+        svc = svc_factory()
+        with (
+            patch("requests.get", side_effect=req.ConnectionError()),
+            patch("app.services.transcription._lemonade_start_server") as mock_start,
+        ):
+            svc.probe_only()
+        mock_start.assert_not_called()
+
+    def test_constructor_honours_server_url(self, svc_factory):
+        """TranscriptionService stores the passed server_url as _endpoint."""
+        svc = svc_factory(server_url="http://myhost:9999")
+        assert svc._endpoint == "http://myhost:9999"
+
+    def test_set_base_url_updates_endpoint_and_clears_ready(self, svc_factory):
+        """set_base_url() updates _endpoint and resets _ready flag."""
+        svc = svc_factory()
+        svc._ready = True
+        svc.set_base_url("http://newhost:1234")
+        assert svc._endpoint == "http://newhost:1234"
+        assert svc._ready is False
+
+
+# ---------------------------------------------------------------------------
 # ensure_ready tests
 # ---------------------------------------------------------------------------
 
@@ -394,3 +466,178 @@ class TestStreaming:
 
         svc.stream_send_audio(b"\xff\xff")
         assert svc._audio_queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# Observability tests (ADR-5)
+# ---------------------------------------------------------------------------
+
+
+class TestObservability:
+    """Tests for the one-shot INFO log on the first non-session.updated event."""
+
+    def _make_ready_svc(self, svc_factory):
+        svc = svc_factory()
+        svc._ready = True
+        svc._model_loaded = True
+        return svc
+
+    def _drive_receive_loop(self, svc, events):
+        """Drive _receive_loop synchronously with a fixed list of mock events.
+
+        Each item in *events* must be a SimpleNamespace (or object) with a
+        ``type`` attribute. The loop exits when the iterator is exhausted.
+        """
+        import asyncio
+
+        svc._stream_running = True
+
+        async def _aiter(event_list):
+            for e in event_list:
+                yield e
+
+        class _FakeConn:
+            def __aiter__(self_inner):
+                return _aiter(events).__aiter__()
+
+        asyncio.run(svc._receive_loop(_FakeConn()))
+
+    def test_first_non_session_updated_event_is_logged_at_info(
+        self, svc_factory, caplog
+    ):
+        """_receive_loop must emit exactly one INFO log on the first non-session.updated event."""
+        import logging
+        from types import SimpleNamespace
+
+        svc = self._make_ready_svc(svc_factory)
+
+        events = [
+            SimpleNamespace(type="session.updated"),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta",
+                delta="hi",
+            ),
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta",
+                delta=" there",
+            ),
+        ]
+
+        with caplog.at_level(logging.INFO, logger="app.services.transcription"):
+            self._drive_receive_loop(svc, events)
+
+        first_event_logs = [
+            r
+            for r in caplog.records
+            if "[STREAM] First non-session.updated event:" in r.message
+        ]
+        assert len(first_event_logs) == 1, (
+            f"Expected exactly 1 first-event INFO log, got {len(first_event_logs)}: "
+            f"{[r.message for r in first_event_logs]}"
+        )
+        assert (
+            "conversation.item.input_audio_transcription.delta"
+            in first_event_logs[0].message
+        )
+
+    def test_subsequent_non_session_updated_events_do_not_refire_log(
+        self, svc_factory, caplog
+    ):
+        """The one-shot log must fire only once even if many non-session.updated events arrive."""
+        import logging
+        from types import SimpleNamespace
+
+        svc = self._make_ready_svc(svc_factory)
+
+        # Five non-session.updated events — only the first should trigger the log.
+        events = [
+            SimpleNamespace(
+                type="conversation.item.input_audio_transcription.delta",
+                delta=f"word{i}",
+            )
+            for i in range(5)
+        ]
+
+        with caplog.at_level(logging.INFO, logger="app.services.transcription"):
+            self._drive_receive_loop(svc, events)
+
+        first_event_logs = [
+            r
+            for r in caplog.records
+            if "[STREAM] First non-session.updated event:" in r.message
+        ]
+        assert len(first_event_logs) == 1, (
+            f"One-shot log fired {len(first_event_logs)} times; expected exactly 1"
+        )
+
+    def test_health_endpoint_error_during_version_capture_does_not_abort_stream(
+        self, svc_factory, caplog
+    ):
+        """A health-endpoint failure during version capture must be swallowed.
+
+        _stream_session must still proceed to connect — the version log is
+        diagnostic-only and must never gate the stream start (ADR-6).
+        """
+        import asyncio
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        svc = self._make_ready_svc(svc_factory)
+        svc._stream_running = True
+
+        conn = MagicMock()
+        conn.session = MagicMock()
+        conn.session.update = AsyncMock()
+        conn.recv = AsyncMock(return_value=SimpleNamespace(type="session.created"))
+        conn.input_audio_buffer = MagicMock()
+        conn.input_audio_buffer.append = AsyncMock()
+        conn.input_audio_buffer.commit = AsyncMock()
+
+        async def _aiter_empty():
+            return
+            yield  # pragma: no cover
+
+        conn.__aiter__ = lambda self_inner: _aiter_empty()
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_client = MagicMock()
+        mock_client.beta.realtime.connect = MagicMock(return_value=ctx)
+
+        connected = {"called": False}
+
+        async def _run():
+            with (
+                patch("app.services.transcription._get_ws_port", return_value=9000),
+                # Health GET raises — simulates an unreachable health endpoint.
+                patch(
+                    "app.services.transcription.requests.get",
+                    side_effect=ConnectionError("health endpoint down"),
+                ),
+                patch(
+                    "app.services.transcription.AsyncOpenAI",
+                    return_value=mock_client,
+                ),
+            ):
+                await svc._stream_session()
+                connected["called"] = True
+
+        with caplog.at_level(logging.WARNING, logger="app.services.transcription"):
+            asyncio.run(_run())
+
+        # Stream must have proceeded despite the health failure.
+        assert connected["called"], "Stream session did not complete"
+
+        # A WARNING about version unavailability must have been emitted.
+        version_warnings = [
+            r
+            for r in caplog.records
+            if "Lemonade version unavailable" in r.message
+            and r.levelno == logging.WARNING
+        ]
+        assert len(version_warnings) >= 1, (
+            "Expected at least one WARNING about Lemonade version unavailability"
+        )

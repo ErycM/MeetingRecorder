@@ -204,46 +204,158 @@ class TestStartStop:
 
 
 # ---------------------------------------------------------------------------
+# Stream-sink wiring tests (regression guard for the zero-events bug)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamSink:
+    """Guards the fix for the bug where set_stream_sink() silently dropped
+    the callback if called before start() instantiated the recorder.  The
+    orchestrator's _start_recording() calls set_stream_sink() first and
+    start() second — so the service must buffer the sink and apply it
+    inside start()."""
+
+    def test_set_stream_sink_before_start_applies_after_start(
+        self, fake_recorder, tmp_path
+    ):
+        """sink wired BEFORE start() → applied to recorder during start()."""
+        from app.services.recording import RecordingService
+
+        def sink(_chunk: bytes) -> None:
+            pass
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            svc.set_stream_sink(sink)
+
+            # Before start: recorder does not exist yet, so callback
+            # cannot be on it — but the service must have buffered it.
+            assert fake_recorder._on_audio_chunk is None
+
+            svc.start(tmp_path / "out.wav")
+
+            # After start: the buffered sink is applied to the recorder.
+            assert fake_recorder._on_audio_chunk is sink
+
+            svc.stop()
+
+    def test_set_stream_sink_mid_recording_applies_immediately(
+        self, fake_recorder, tmp_path
+    ):
+        """sink wired DURING a recording is applied to the live recorder."""
+        from app.services.recording import RecordingService
+
+        def sink(_chunk: bytes) -> None:
+            pass
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            assert fake_recorder._on_audio_chunk is None
+
+            svc.set_stream_sink(sink)
+
+            assert fake_recorder._on_audio_chunk is sink
+
+            svc.stop()
+
+    def test_set_stream_sink_none_clears_buffer_and_live_callback(
+        self, fake_recorder, tmp_path
+    ):
+        """set_stream_sink(None) clears both the buffered sink and the
+        live recorder callback (I-5 compliance check)."""
+        from app.services.recording import RecordingService
+
+        def sink(_chunk: bytes) -> None:
+            pass
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService()
+            svc.set_stream_sink(sink)
+            svc.start(tmp_path / "out.wav")
+            assert fake_recorder._on_audio_chunk is sink
+
+            svc.set_stream_sink(None)
+
+            # Live recorder callback is cleared.
+            assert fake_recorder._on_audio_chunk is None
+            # Internal buffer is cleared — a later start() without
+            # a fresh set_stream_sink() must not re-wire the old sink.
+            assert svc._stream_sink is None
+
+            svc.stop()
+
+
+# ---------------------------------------------------------------------------
 # Silence-timeout tests
 # ---------------------------------------------------------------------------
 
 
 class TestSilenceTimeout:
-    def test_silence_timeout_fires_on_silence_detected_then_stops(
+    def test_silence_timeout_fires_on_silence_detected_handler_drives_stop(
         self, fake_recorder, tmp_path
     ):
-        """After silence_timeout_s of silence, on_silence_detected fires then stop()."""
+        """With a handler wired, silence timeout fires on_silence_detected
+        and the handler is responsible for calling stop().  The service
+        does NOT auto-dispatch its own stop() (avoids the double-stop
+        warning observed in real runs)."""
         from app.services.recording import RecordingService
 
         silence_fired = threading.Event()
         stopped = threading.Event()
+        svc_ref: list[RecordingService] = []
 
         def _on_silence():
             silence_fired.set()
+            # Mimic the orchestrator: handler owns the stop transition.
+            svc_ref[0].stop()
 
         def _on_stopped(p: Path, d: float):
             stopped.set()
 
-        # Make seconds_since_audio appear huge so the timeout triggers immediately
         fake_recorder.seconds_since_audio = 999.0
 
         def _sync_dispatch(fn):
-            # Simulate window.after(0, fn) — call inline so test stays single-threaded
             fn()
 
         with patch(_RECORDER_PATCH, return_value=fake_recorder):
             svc = RecordingService(
-                silence_timeout_s=0.05,  # very short for test speed
+                silence_timeout_s=0.05,
                 dispatch=_sync_dispatch,
                 on_silence_detected=_on_silence,
                 on_recording_stopped=_on_stopped,
             )
+            svc_ref.append(svc)
             wav = tmp_path / "out.wav"
             svc.start(wav)
 
-            # Wait for the silence thread to fire
             assert silence_fired.wait(timeout=3.0), "on_silence_detected never fired"
             assert stopped.wait(timeout=3.0), "recording never stopped"
+
+        assert not svc.is_recording
+
+    def test_silence_timeout_without_handler_auto_stops(self, fake_recorder, tmp_path):
+        """Fallback: with no on_silence_detected handler wired, the
+        service auto-stops itself so standalone callers still get the
+        expected stop behavior."""
+        from app.services.recording import RecordingService
+
+        stopped = threading.Event()
+        fake_recorder.seconds_since_audio = 999.0
+
+        def _sync_dispatch(fn):
+            fn()
+
+        with patch(_RECORDER_PATCH, return_value=fake_recorder):
+            svc = RecordingService(
+                silence_timeout_s=0.05,
+                dispatch=_sync_dispatch,
+                on_silence_detected=None,  # no handler
+                on_recording_stopped=lambda p, d: stopped.set(),
+            )
+            svc.start(tmp_path / "out.wav")
+
+            assert stopped.wait(timeout=3.0), "auto-stop fallback never fired"
 
         assert not svc.is_recording
 

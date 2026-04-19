@@ -327,6 +327,45 @@ class TestUsefulTranscriptFilter:
 
 
 # ---------------------------------------------------------------------------
+# Lemonade probe failure → ERROR with LEMONADE_UNREACHABLE reason
+# ---------------------------------------------------------------------------
+
+
+class TestNpuStartupCheckLemonadeFailure:
+    def test_npu_startup_check_failure_sets_lemonade_unreachable(
+        self, tmp_path: Path
+    ) -> None:
+        """_npu_startup_check failure → AppState.ERROR / LEMONADE_UNREACHABLE.
+
+        Drives _npu_startup_check() synchronously (not via a thread in the
+        test). The mock TranscriptionService.ensure_ready() raises
+        TranscriptionNotReady; the orchestrator must dispatch _on_npu_failed
+        and end up in ERROR with reason LEMONADE_UNREACHABLE.
+        """
+        from app.services.transcription import TranscriptionNotReady
+
+        cfg = _make_config(tmp_path)
+        orch, states = _make_orchestrator(cfg)
+
+        # Make ensure_ready() raise TranscriptionNotReady
+        orch._transcription_svc.ensure_ready.side_effect = TranscriptionNotReady(
+            "connection refused"
+        )
+
+        # Drive _npu_startup_check synchronously
+        orch._npu_startup_check()
+
+        assert orch._sm.current is AppState.ERROR, (
+            f"Expected ERROR, got {orch._sm.current}"
+        )
+        error_transitions = [
+            (old, new, r) for old, new, r in states if new is AppState.ERROR
+        ]
+        assert len(error_transitions) == 1
+        assert error_transitions[0][2] is ErrorReason.LEMONADE_UNREACHABLE
+
+
+# ---------------------------------------------------------------------------
 # Silent-capture safety net (_transition_to_armed auto-rearm suppression)
 # ---------------------------------------------------------------------------
 

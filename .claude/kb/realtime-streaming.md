@@ -48,13 +48,27 @@ async with client.beta.realtime.connect(model="Whisper-Large-v3-Turbo") as conn:
     ...
 ```
 
+### Session setup — A2 defaults-only
+
+We do **not** call `session.update`. The model is carried in the WS URL query
+string (the OpenAI SDK injects it automatically when `beta.realtime.connect(model=...)`
+is used), and Lemonade's defaults for input format and VAD already match our
+recorder output verbatim. Sending any OpenAI-shaped `session.update` payload
+(i.e. any object containing `input_audio_format`, `input_audio_transcription`, or
+`turn_detection.type`) will be silently serialized by the OpenAI SDK and silently
+ignored by Lemonade, resulting in zero transcription events for the entire session.
+See Critical Rule 8 and `.claude/kb/lemonade-whisper-npu.md` — "Session setup —
+Approach A2 (defaults-only)".
+
+Ground truth for the Lemonade payload shape is the canonical example:
+https://github.com/lemonade-sdk/lemonade/blob/main/examples/realtime_transcription.py
+
 ### Client → server messages
 
 | Message | Purpose |
 |---------|---------|
 | `conn.input_audio_buffer.append(audio=<base64-pcm16>)` | Feed audio |
 | `conn.input_audio_buffer.commit()` | Signal end-of-utterance; force finalize |
-| (session.update — not used by us; defaults are fine) | |
 
 ### Server → client events
 
@@ -187,9 +201,9 @@ Symptoms and what to check:
 
 ## Practical tips for extending
 
-- **Adding speaker diarization**: The OpenAI realtime spec allows `session.update` with turn detection parameters. Lemonade's support may be partial — probe with a session.update and inspect the response events.
-- **Changing the model**: Update `WHISPER_MODEL` constant in BOTH `transcriber.py` and `stream_transcriber.py`. They must match or you'll get different results on stream vs batch.
-- **Language hints**: `conn` accepts a `session.update` with `input_audio_transcription.language = "en"`. Sending this early reduces first-chunk latency.
+- **Adding speaker diarization or VAD tuning**: If a future feature needs non-default VAD parameters, use Lemonade's flat `session.update` schema — `{session: {turn_detection: {threshold, silence_duration_ms, prefix_padding_ms}}}` — with **no `type` field** inside `turn_detection`. OpenAI's `{type: "server_vad"}` shape is NOT accepted by Lemonade; it will be silently ignored. Always cross-check against the canonical example before sending any new payload keys.
+- **Changing the model**: Update the `WHISPER_MODEL` constant in `src/app/services/transcription.py`. The batch and streaming paths share this constant — they must stay in sync.
+- **Language hints**: Lemonade may support a `session.update` with language hints, but the canonical example does not use them. Probe on real hardware and verify via `[STREAM] Event-type counts:` before shipping.
 
 ---
 

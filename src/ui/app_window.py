@@ -104,6 +104,7 @@ class AppWindow:
             tab_live,
             on_stop=on_stop,
             on_dismiss_capture_warning=on_dismiss_capture_warning,
+            on_open_settings=lambda: self.switch_tab("Settings"),
         )
         self._history_tab = HistoryTab(
             tab_history,
@@ -152,6 +153,13 @@ class AppWindow:
     # ------------------------------------------------------------------
     # Window lifecycle — T1 only
     # ------------------------------------------------------------------
+
+    def switch_tab(self, name: str) -> None:
+        """Programmatically switch to a named tab. Must be on T1."""
+        try:
+            self._tabview.set(name)
+        except Exception as exc:
+            log.warning("[APP_WINDOW] switch_tab(%r) failed: %s", name, exc)
 
     def show(self) -> None:
         """Make the window visible and bring it to front."""
@@ -214,10 +222,16 @@ class AppWindow:
             msg = f"ERROR: {reason_name}"
             self._live_tab.set_status(msg)
             self._settings_tab.set_error_banner(reason_name)
+            # Lemonade-specific banner on Live tab
+            from app.state import ErrorReason
+
+            if reason is ErrorReason.LEMONADE_UNREACHABLE:
+                self._live_tab.show_lemonade_banner()
             log.error("[APP_WINDOW] Entered ERROR state: %s", reason_name)
 
         if new is not AppState.ERROR:
             self._settings_tab.set_error_banner(None)
+            self._live_tab.hide_lemonade_banner()
 
     # ------------------------------------------------------------------
     # Pass-through helpers for orchestrator

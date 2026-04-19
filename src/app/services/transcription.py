@@ -258,6 +258,46 @@ class TranscriptionService:
         self._emit_state("ready")
         return npu_status
 
+    def probe_only(self, timeout_s: float = 1.0) -> tuple[bool, str]:
+        """Non-blocking Lemonade reachability probe (read-only diagnostic).
+
+        Unlike ``ensure_ready()``, this method:
+        - does NOT start the server (no subprocess.Popen)
+        - does NOT load a model
+        - does NOT transition the app state
+        - does NOT raise (errors returned as (False, reason))
+
+        Used by SettingsTab's Lemonade reachability row and LiveTab's banner
+        (post-retry probe). Safe to call repeatedly and from any thread
+        that has an HTTP socket budget.
+
+        Returns
+        -------
+        (True, "") on success.
+        (False, reason) on failure — reason is a short one-line string
+            such as ``"connection refused"`` or ``"http 503"``.
+        """
+        try:
+            r = requests.get(f"{self._endpoint}/api/v1/health", timeout=timeout_s)
+            if r.status_code != 200:
+                return False, f"http {r.status_code}"
+            return True, ""
+        except requests.Timeout:
+            return False, "timeout"
+        except requests.ConnectionError:
+            return False, "connection refused"
+        except requests.RequestException as exc:
+            return False, f"request error: {exc.__class__.__name__}"
+
+    def set_base_url(self, server_url: str) -> None:
+        """Update endpoint URL for probe_only/ensure_ready.
+
+        Thread-safe for the next call only; callers must stop streaming
+        before mutating URL to avoid mid-flight mismatch.
+        """
+        self._endpoint = server_url.rstrip("/")
+        self._ready = False  # force re-ensure_ready after URL change
+
     # ------------------------------------------------------------------
     # Public API — batch transcription
     # ------------------------------------------------------------------
@@ -539,6 +579,16 @@ class TranscriptionService:
             "[STREAM] Connecting to ws://localhost:%d (model: %s)", ws_port, self._model
         )
 
+        # Approach A2 (ADR-1): capture Lemonade server version for diagnostics.
+        # Best-effort only — a health-endpoint failure must never abort the stream.
+        try:
+            r = requests.get(f"{self._endpoint}/api/v1/health", timeout=3)
+            data = r.json()
+            version = data.get("version") or data.get("server_version") or "unknown"
+            log.info("[STREAM] Lemonade server version=%s", version)
+        except Exception as exc:
+            log.warning("[STREAM] Lemonade version unavailable: %s", exc)
+
         client = AsyncOpenAI(
             api_key="unused",
             base_url=f"{self._endpoint}/api/v1",
@@ -554,22 +604,18 @@ class TranscriptionService:
                 if event.type == "session.created":
                     log.info("[STREAM] Session created")
 
-                # Enable server-side VAD so Whisper auto-commits on pauses
-                # and emits transcription events during the session instead
-                # of only at end-of-session. Lemonade's whisper.cpp realtime
-                # backend does not auto-VAD by default — without this we get
-                # 0 segments for the entire call (verified empirically).
-                try:
-                    await conn.session.update(
-                        session={
-                            "input_audio_format": "pcm16",
-                            "input_audio_transcription": {"model": self._model},
-                            "turn_detection": {"type": "server_vad"},
-                        }
-                    )
-                    log.info("[STREAM] session.update sent (server_vad enabled)")
-                except Exception as exc:
-                    log.warning("[STREAM] session.update failed: %s", exc)
+                # Approach A2 (ADR-1): no session.update is sent.
+                # Lemonade binds the model via the URL query string (?model=<name>),
+                # which the OpenAI SDK injects automatically from the `model=` argument
+                # passed to beta.realtime.connect above. Lemonade's defaults for input
+                # format (PCM16 LE mono 16 kHz) and VAD (threshold 0.01,
+                # silence_duration_ms 800, prefix_padding_ms 250) already match our
+                # recorder output verbatim. Sending an OpenAI-shaped session.update
+                # (with input_audio_format, input_audio_transcription, or
+                # turn_detection.type) is silently accepted by the SDK but silently
+                # ignored by Lemonade, causing zero transcription events for the whole
+                # session. See Critical Rule 8 and .claude/kb/lemonade-whisper-npu.md
+                # "Session setup — Approach A2 (defaults-only)".
 
                 sender = asyncio.create_task(self._send_loop(conn))
                 receiver = asyncio.create_task(self._receive_loop(conn))
@@ -634,6 +680,9 @@ class TranscriptionService:
         # Diagnostic: count event types we observe so we can prove which
         # events Lemonade actually emits (vs which we're listening for).
         event_counts: dict[str, int] = {}
+        # ADR-5: one-shot INFO log on the first event that is not session.created /
+        # session.updated — proves the stream is alive without flooding INFO.
+        first_transcription_event_logged: bool = False
         try:
             async for event in conn:
                 if not self._stream_running:
@@ -641,6 +690,17 @@ class TranscriptionService:
 
                 etype = getattr(event, "type", "<no-type>")
                 event_counts[etype] = event_counts.get(etype, 0) + 1
+
+                if (
+                    etype not in ("session.created", "session.updated")
+                    and not first_transcription_event_logged
+                ):
+                    log.info(
+                        "[STREAM] First non-session.updated event: %s (event #%d)",
+                        etype,
+                        sum(event_counts.values()),
+                    )
+                    first_transcription_event_logged = True
 
                 if etype == "conversation.item.input_audio_transcription.delta":
                     delta = getattr(event, "delta", "")
@@ -659,6 +719,16 @@ class TranscriptionService:
                 elif etype == "error":
                     msg = getattr(getattr(event, "error", None), "message", str(event))
                     log.error("[STREAM] Server error: %s", msg)
+                elif etype in (
+                    "input_audio_buffer.speech_started",
+                    "input_audio_buffer.speech_stopped",
+                    "input_audio_buffer.committed",
+                    "input_audio_buffer.cleared",
+                ):
+                    # Expected VAD / buffer lifecycle events per the
+                    # Lemonade realtime spec.  Counted in event_counts
+                    # for diagnostics, but no routing action needed.
+                    pass
                 else:
                     # Surface unknown event types at INFO (only the first
                     # occurrence of each type) so we can adapt the handler.
