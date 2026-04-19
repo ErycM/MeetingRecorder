@@ -1,0 +1,85 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write  # required for softprops/action-gh-release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.0"
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $line = Select-String -Path src/app/__version__.py `
+            -Pattern '__version__[^"]*"([^"]+)"'
+          $v = $line.Matches.Groups[1].Value
+          Write-Host "VERSION=$v"
+          "VERSION=$v" | Out-File $env:GITHUB_ENV -Append
+          "version=$v"  | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Pre-freeze tests (build gate)
+        shell: pwsh
+        run: python -m pytest tests/ --maxfail=1 -q
+
+      - name: PyInstaller freeze
+        shell: pwsh
+        run: pyinstaller --noconfirm MeetingRecorder.spec
+
+      - name: Freeze sanity check
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/MeetingRecorder/MeetingRecorder.exe")) {
+            Write-Error "MeetingRecorder.exe missing from dist/"
+            exit 1
+          }
+          if (-not (Test-Path "dist/MeetingRecorder/_internal")) {
+            Write-Error "_internal/ missing from dist/"
+            exit 1
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source
+          & $iscc "/dAppVersion=$env:VERSION" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeetingRecorder_Setup_v${{ steps.ver.outputs.version }}
+          path: installer_output/*.exe
+          retention-days: 30
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          draft: true
+          prerelease: false
+          files: installer_output/*.exe

@@ -4,3 +4,12 @@ logs/
 *.log
 @AutomationLog.txt
 summary.csv
+
+# PyInstaller / Inno Setup build outputs
+build/
+dist/
+installer_output/
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/

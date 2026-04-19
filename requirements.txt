@@ -1,4 +1,4 @@
-# MeetingRecorder v3 (main.py)
+# MeetingRecorder v4 (src/main.py)
 PyAudioWPatch>=0.2.12
 numpy>=1.24
 scipy>=1.10
@@ -7,7 +7,11 @@ pystray>=0.19
 Pillow>=9.0
 openai>=1.59
 websockets>=12.0
+customtkinter>=5.2
+keyboard>=0.13
 
-# Legacy entry point (SaveLiveCaptionsWithLC.py)
-uiautomation>=2.0
-aiofiles>=23.0
+# Phase 1 refactor additions
+tomli-w>=1.0
+pywin32>=306
+pytest>=7.0
+ruff>=0.1
