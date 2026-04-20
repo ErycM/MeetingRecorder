@@ -662,7 +662,8 @@ class Orchestrator:
         """Save transcript to vault and archive WAV. Runs on T_save."""
         try:
             md_path = self._new_transcript_path()
-            self._write_md(md_path, text, duration_s)
+            meta = self._build_transcript_meta(duration_s=duration_s)
+            self._write_md(md_path, text, meta=meta)
             archived_wav = self._archive_wav(wav_path, md_path)
             self._window.dispatch(  # type: ignore[attr-defined]
                 lambda: self._on_save_complete(md_path, archived_wav, duration_s)
@@ -1116,7 +1117,8 @@ class Orchestrator:
             else:
                 md_path = wav_path.parent / f"{stem}_retranscribed.md"
 
-            self._write_md(md_path, text, None)
+            meta = self._build_transcript_meta(duration_s=None)
+            self._write_md(md_path, text, meta=meta)
             log.info("[ORCH] Re-transcribed: %s", md_path.name)
 
             from app.services.history_index import HistoryEntry
@@ -1265,16 +1267,64 @@ class Orchestrator:
         target_dir.mkdir(parents=True, exist_ok=True)
         return target_dir / filename
 
-    def _write_md(self, path: Path, text: str, duration_s: float | None) -> None:
-        """Write a Markdown transcript file."""
+    def _build_transcript_meta(
+        self, *, duration_s: float | None
+    ) -> "TranscriptMetadata":
+        """Collect the metadata that's cheaply available at save time.
+
+        Passo A of Onda 1.2 — only the fields that can be read without
+        new instrumentation. Passo B will add mic/loopback peaks, stop
+        reason, source apps, etc.
+        """
+        from datetime import datetime
+
+        from app.transcript_meta import TranscriptMetadata
+
+        whisper_model = getattr(self._config, "whisper_model", None) or None
+
+        peak_mixed: float | None
+        try:
+            peak_mixed = float(
+                self._recording_svc.get_last_peak_level()  # type: ignore[attr-defined]
+            )
+        except Exception:
+            peak_mixed = None
+
+        return TranscriptMetadata(
+            saved_at=datetime.now().astimezone(),
+            duration_s=duration_s,
+            whisper_model=whisper_model,
+            peak_mixed=peak_mixed,
+        )
+
+    def _write_md(
+        self,
+        path: Path,
+        text: str,
+        *,
+        meta: "TranscriptMetadata | None" = None,
+    ) -> None:
+        """Write a Markdown transcript file with optional YAML frontmatter."""
+        from app.transcript_meta import render_frontmatter
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        lines = ["# Meeting Transcript\n"]
+
+        parts: list[str] = []
+        if meta is not None:
+            frontmatter = render_frontmatter(meta)
+            if frontmatter:
+                parts.append(frontmatter)
+                parts.append("\n")  # blank line between frontmatter and heading
+
+        parts.append("# Meeting Transcript\n\n")
+        duration_s = meta.duration_s if meta is not None else None
         if duration_s is not None:
             m = int(duration_s) // 60
             s = int(duration_s) % 60
-            lines.append(f"**Duration:** {m}:{s:02d}\n\n")
-        lines.append(text)
-        path.write_text("\n".join(lines), encoding="utf-8")
+            parts.append(f"**Duration:** {m}:{s:02d}\n\n")
+        parts.append(text)
+
+        path.write_text("".join(parts), encoding="utf-8")
 
     def _archive_wav(self, wav_path: Path, md_path: Path) -> Path | None:
         """Move the temp WAV to the configured WAV archive directory.
