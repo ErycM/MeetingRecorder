@@ -121,7 +121,7 @@ class AppWindow:
             tab_history,
             history_index=history_index,
             dispatch=self.dispatch,
-            vault_dir=config.vault_dir if config else None,
+            vault_dir=config.transcript_dir if config else None,
             on_retranscribe=on_retranscribe,
             on_delete=on_delete_entry,
             on_rename=on_rename_entry,

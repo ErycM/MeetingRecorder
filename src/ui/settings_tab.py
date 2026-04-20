@@ -265,10 +265,13 @@ class SettingsTab:
         # ----------------------------------------------------------------
         _hdr("Storage")
 
-        # Vault directory
+        # Transcript directory (where SaveLiveCaptions writes .md transcripts)
+        # Label kept as "Vault directory" for backward-compat with user's
+        # mental model; Onda 1.3 introduces a separate "Obsidian vault root"
+        # field for URI construction.
         _lbl("Vault directory:")
         self._vault_var = tk.StringVar(
-            value=str(config.vault_dir) if config.vault_dir else ""
+            value=str(config.transcript_dir) if config.transcript_dir else ""
         )
         ctk.CTkEntry(scroll_frame, textvariable=self._vault_var, width=260).grid(
             row=row, column=1, padx=(0, 4), pady=4
@@ -508,7 +511,10 @@ class SettingsTab:
         loop_idx = self._loopback_device_map.get(self._loopback_device_var.get())
 
         new_cfg = cfg_module.Config(
-            vault_dir=Path(vault_str),
+            obsidian_vault_root=(
+                self._config.obsidian_vault_root if self._config else None
+            ),
+            transcript_dir=Path(vault_str),
             wav_dir=Path(wav_str),
             whisper_model=self._model_var.get(),
             silence_timeout=max(5, int(self._silence_str_var.get() or "30")),

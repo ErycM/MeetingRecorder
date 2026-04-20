@@ -39,7 +39,8 @@ from app.services.history_index import HistoryEntry, HistoryIndex
 def _make_config(tmp_path: Path) -> Config:
     """Return a minimal Config with temp dirs."""
     return Config(
-        vault_dir=tmp_path / "vault",
+        obsidian_vault_root=tmp_path / "vault",
+        transcript_dir=tmp_path / "vault" / "raw" / "meetings" / "captures",
         wav_dir=tmp_path / "wav",
         whisper_model="whisper-medium.en",
         silence_timeout=30,
@@ -70,7 +71,7 @@ def _make_orchestrator(cfg: Config) -> object:
     from app.services.caption_router import CaptionRouter
 
     orch._history_index = HistoryIndex(
-        path=cfg.vault_dir / "history.json" if cfg.vault_dir else None
+        path=cfg.transcript_dir / "history.json" if cfg.transcript_dir else None
     )
     orch._caption_router = CaptionRouter()
 

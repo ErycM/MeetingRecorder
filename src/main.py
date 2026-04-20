@@ -69,7 +69,11 @@ def main() -> None:
     try:
         # Step 4 — Load config
         cfg = cfg_module.load()
-        log.info("[MAIN] Config loaded (vault=%s)", cfg.vault_dir)
+        log.info(
+            "[MAIN] Config loaded (vault_root=%s, transcript_dir=%s)",
+            cfg.obsidian_vault_root,
+            cfg.transcript_dir,
+        )
 
         # Step 5 — Theme init (MUST happen before any CTk widget)
         theme.init()
