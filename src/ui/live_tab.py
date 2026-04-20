@@ -2,12 +2,14 @@
 LiveTab — customtkinter frame showing live captions, timer, and start/stop button.
 
 Contents:
-- Timer label (``00:00:00``) updated via ``set_timer(seconds)``.
+- H1 heading label (FR16).
+- Status pill (FR14) + two LED indicators mic/system (FR7-FR8) + demoted timer (FR15).
 - Caption textbox with two text-tag regions:
     - ``partial`` — grey italic (in-progress Whisper delta).
     - ``final``   — near-white normal (completed utterances).
-- Dual-purpose Start/Stop button (fires ``on_toggle_recording`` callback).
-- Toast banner above the timer — success / error / neutral variants.
+- Empty-state label shown when captions are empty in IDLE/ARMED (FR17).
+- Dual-purpose Start/Stop button (fires ``on_toggle_recording`` callback) — promoted CTA (FR18).
+- Toast banner above the status row — success / error / neutral variants.
 - Saved-path status label.
 
 Threading contract
@@ -15,6 +17,12 @@ Threading contract
 All public methods MUST be called from T1 (the Tk mainloop).
 The orchestrator dispatches via ``AppWindow.dispatch(fn)`` before calling
 any method here — never call from a worker thread directly.
+
+LED polling (ADR-2):
+``start_led_poll()`` / ``stop_led_poll()`` control a recurring
+``widget.after(LED_POLL_MS, _tick_led)`` loop that reads per-source RMS
+from RecordingService and updates the LED indicators.  The loop runs
+entirely on T1 — no worker thread, no Lock needed.
 
 CaptionRouter integration
 --------------------------
@@ -58,19 +66,19 @@ _KIND_TO_BG: dict[str, str] = {
 
 
 def _build_state_to_button() -> dict:
-    """Build the AppState → (label, enabled) dict.
+    """Build the AppState -> (label, enabled) dict.
 
     Deferred import so this module is importable without customtkinter.
     """
     from app.state import AppState
 
     return {
-        AppState.IDLE: ("Start Recording", True),
-        AppState.ARMED: ("Start Recording", True),
+        AppState.IDLE: ("Start Now", True),
+        AppState.ARMED: ("Start Now", True),
         AppState.RECORDING: ("Stop Recording", True),
         AppState.TRANSCRIBING: ("Stop Recording", False),
         AppState.SAVING: ("Stop Recording", False),
-        AppState.ERROR: ("Start Recording", False),
+        AppState.ERROR: ("Start Now", False),
     }
 
 
@@ -100,9 +108,14 @@ class LiveTab:
         If both are provided, ``on_toggle_recording`` takes precedence.
     root:
         Root Tk/CTk widget used for ``after()`` / ``after_cancel()`` calls.
-        Pass the AppWindow's ``_root`` object.  Required for toast scheduling.
+        Pass the AppWindow's ``_root`` object.  Required for toast scheduling
+        and LED polling.
     on_dismiss_capture_warning:
         Optional callback fired when the capture-warning Dismiss button is pressed.
+    recording_svc:
+        Optional ``RecordingService`` reference used by the LED poller to read
+        per-source RMS via ``get_source_peaks()``.  May be set later via
+        ``set_recording_svc()``.
     """
 
     def __init__(
@@ -113,15 +126,19 @@ class LiveTab:
         on_dismiss_capture_warning: Callable[[], None] | None = None,
         on_open_settings: Callable[[], None] | None = None,
         root: object = None,
+        recording_svc: object = None,
     ) -> None:
         import customtkinter as ctk
         from ui import theme
+        from ui.widgets.led_indicator import LEDIndicator
+        from ui.widgets.status_pill import StatusPill
 
         # on_toggle_recording takes precedence; on_stop is the deprecated alias
         self._on_toggle_recording = on_toggle_recording or on_stop
         self._on_dismiss_capture_warning = on_dismiss_capture_warning
         self._on_open_settings = on_open_settings
         self._root = root  # for after() / after_cancel()
+        self._recording_svc = recording_svc
 
         # Back-compat: tracks whether the button should currently be enabled
         # for the legacy set_recording() callers still in app_window.
@@ -130,13 +147,15 @@ class LiveTab:
         # Toast cancel token
         self._toast_after_id: object = None
 
+        # LED poll cancel token + running flag
+        self._led_after_id: object = None
+        self._led_polling: bool = False
+
         # Outer frame fills the tab
         self.frame = ctk.CTkFrame(parent)
         self.frame.pack(fill="both", expand=True, padx=theme.PAD_X, pady=theme.PAD_Y)
 
-        # Lemonade-missing banner — hidden by default. Shown when orchestrator
-        # enters AppState.ERROR with ErrorReason.LEMONADE_UNREACHABLE. Dismissable;
-        # state-machine drives re-display on next probe failure.
+        # Lemonade-missing banner — hidden by default.
         self._lemonade_banner_frame = ctk.CTkFrame(
             self.frame, fg_color="#2a3a5a", corner_radius=6
         )
@@ -161,10 +180,7 @@ class LiveTab:
             side="right", padx=theme.PAD_INNER, pady=4
         )
 
-        # Capture-warning banner — hidden by default. Shown when the
-        # orchestrator detects consecutive silent recordings (wrong audio
-        # endpoint picked) so the user has a visible signal instead of
-        # an invisible auto-rearm loop.
+        # Capture-warning banner — hidden by default.
         self._capture_warning_frame = ctk.CTkFrame(
             self.frame, fg_color="#5a2a2a", corner_radius=6
         )
@@ -187,8 +203,7 @@ class LiveTab:
         )
         self._capture_warning_dismiss.pack(side="right", padx=theme.PAD_INNER, pady=4)
 
-        # Toast banner — separate slot from the capture-warning frame (SC-4).
-        # Hidden by default; appears above the timer.
+        # Toast banner — separate slot (SC-4).
         self._toast_frame = ctk.CTkFrame(
             self.frame, fg_color=_TOAST_SUCCESS_BG, corner_radius=6
         )
@@ -204,15 +219,41 @@ class LiveTab:
             side="left", fill="x", expand=True, padx=theme.PAD_INNER, pady=4
         )
 
-        # Timer label
-        self._timer_label = ctk.CTkLabel(
+        # H1 heading (FR16)
+        self._heading_label = ctk.CTkLabel(
             self.frame,
-            text="00:00:00",
-            font=theme.FONT_TIMER,
+            text="Live",
+            font=theme.FONT_HEADING,
+            anchor="w",
         )
-        self._timer_label.pack(pady=(theme.PAD_Y, 4))
+        self._heading_label.pack(fill="x", padx=theme.PAD_INNER, pady=(theme.PAD_Y, 2))
 
-        # Caption textbox — we use a plain tk.Text inside a CTkFrame for tag support
+        # Status row: pill + LEDs + timer
+        status_row = ctk.CTkFrame(self.frame, fg_color="transparent")
+        status_row.pack(fill="x", padx=theme.PAD_INNER, pady=(0, 4))
+
+        # StatusPill (FR14)
+        self._pill = StatusPill(status_row)
+        self._pill.frame.pack(side="left", padx=(0, theme.PAD_INNER))
+
+        # LED indicators (FR7) — hidden until RECORDING (FR12)
+        self._led_mic = LEDIndicator(status_row, "MIC")
+        self._led_mic.frame.pack(side="left", padx=(0, theme.PAD_INNER))
+        self._led_system = LEDIndicator(status_row, "SYSTEM")
+        self._led_system.frame.pack(side="left", padx=(0, theme.PAD_INNER))
+        # Start hidden — shown by start_led_poll(), hidden by stop_led_poll()
+        self._led_mic.frame.pack_forget()
+        self._led_system.frame.pack_forget()
+
+        # Demoted timer (FR15 — <=16 pt, not the largest element)
+        self._timer_label = ctk.CTkLabel(
+            status_row,
+            text="00:00:00",
+            font=theme.FONT_TIMER_DEMOTED,
+        )
+        self._timer_label.pack(side="right")
+
+        # Caption textbox — plain tk.Text inside a CTkFrame for tag support
         caption_frame = ctk.CTkFrame(self.frame)
         caption_frame.pack(fill="both", expand=True, padx=0, pady=(0, theme.PAD_INNER))
 
@@ -223,7 +264,7 @@ class LiveTab:
             relief="flat",
             bg="#1a1a2e",
             fg=theme.FINAL_FG,
-            font=theme.FONT_CAPTION,
+            font=theme.FONT_CAPTION_CAPTIONS,
             insertbackground=theme.FINAL_FG,
             selectbackground="#3a3a5e",
             padx=theme.PAD_INNER,
@@ -232,16 +273,20 @@ class LiveTab:
         )
         self._text.pack(fill="both", expand=True)
 
-        # Configure text tags
+        # Configure text tags (FR19 floor preserved; font promoted to ≥14pt per Fix 2)
         self._text.tag_configure(
             "partial",
             foreground=theme.PARTIAL_FG,
-            font=(theme.FONT_CAPTION[0], theme.FONT_CAPTION[1], "italic"),
+            font=(
+                theme.FONT_CAPTION_CAPTIONS[0],
+                theme.FONT_CAPTION_CAPTIONS[1],
+                "italic",
+            ),
         )
         self._text.tag_configure(
             "final",
             foreground=theme.FINAL_FG,
-            font=theme.FONT_CAPTION,
+            font=theme.FONT_CAPTION_CAPTIONS,
         )
 
         # Set up partial marks (initially at end-of-buffer)
@@ -252,15 +297,33 @@ class LiveTab:
         self._text.mark_gravity(_PARTIAL_MARK_END, "right")
         self._text.config(state="disabled")
 
-        # Bottom row: start/stop button + saved status
+        # Empty-state label (FR17) — SEPARATE widget from textbox (R5)
+        # Packed inside caption_frame, swapped via pack_forget/pack.
+        self._empty_state_label = ctk.CTkLabel(
+            caption_frame,
+            text="Captions will appear here once recording starts",
+            font=theme.FONT_STATUS,
+            text_color="#555555",
+            anchor="center",
+            justify="center",
+        )
+        # Show empty-state initially; hidden when captions are non-empty
+        self._text.pack_forget()
+        self._empty_state_label.pack(fill="both", expand=True)
+        self._captions_empty: bool = True
+
+        # Bottom row: promoted Start Now CTA (FR18) + saved status
         bottom = ctk.CTkFrame(self.frame)
         bottom.pack(fill="x", pady=(0, theme.PAD_Y))
 
         self._action_btn = ctk.CTkButton(
             bottom,
-            text="Start Recording",
+            text="Start Now",
             command=self._on_button_clicked,
             state="normal",
+            width=140,
+            height=36,
+            font=(theme.FONT_LABEL[0], theme.FONT_LABEL[1] + 1, "bold"),
         )
         self._action_btn.pack(side="left", padx=(0, theme.PAD_INNER))
 
@@ -275,6 +338,10 @@ class LiveTab:
     # ------------------------------------------------------------------
     # Public API — all must be called from T1
     # ------------------------------------------------------------------
+
+    def set_recording_svc(self, recording_svc: object) -> None:
+        """Wire the RecordingService reference used by the LED poller."""
+        self._recording_svc = recording_svc
 
     def apply_app_state(self, state: object) -> None:
         """Update the action button label + enabled state for *state*.
@@ -293,6 +360,64 @@ class LiveTab:
         except Exception as exc:
             log.warning("[LIVE] apply_app_state configure failed: %s", exc)
 
+    def apply_pill(self, state: object, subtitle: str = "") -> None:
+        """Update the status pill for *state* (FR14).  T1 only."""
+        try:
+            self._pill.set_state(state, subtitle)
+            self._pill.frame.pack(side="left", padx=(0, 8))
+        except Exception as exc:
+            log.warning("[LIVE] apply_pill failed: %s", exc)
+
+    def set_pill_saved(self) -> None:
+        """Show green SAVED pill (FR14 post-save state).  T1 only."""
+        try:
+            self._pill.set_saved()
+            self._pill.frame.pack(side="left", padx=(0, 8))
+        except Exception as exc:
+            log.warning("[LIVE] set_pill_saved failed: %s", exc)
+
+    def hide_pill(self) -> None:
+        """Hide the status pill.  T1 only."""
+        try:
+            self._pill.hide()
+        except Exception as exc:
+            log.warning("[LIVE] hide_pill failed: %s", exc)
+
+    def start_led_poll(self) -> None:
+        """Start the 5 Hz LED polling loop (ADR-2).  T1 only.
+
+        Shows the LED frames and schedules the first tick via after().
+        No-op if already polling.
+        """
+        if self._led_polling:
+            return
+        self._led_polling = True
+        # Show LED widgets now
+        try:
+            self._led_mic.frame.pack(side="left", padx=(0, 8))
+            self._led_system.frame.pack(side="left", padx=(0, 8))
+        except Exception:
+            pass
+        self._schedule_led_tick()
+
+    def stop_led_poll(self) -> None:
+        """Stop the LED polling loop and hide LED widgets.  T1 only."""
+        self._led_polling = False
+        if self._led_after_id is not None:
+            try:
+                self._root.after_cancel(self._led_after_id)  # type: ignore[union-attr]
+            except Exception:
+                pass
+            self._led_after_id = None
+        # Reset LEDs to idle and hide
+        try:
+            self._led_mic.set_active(False)
+            self._led_system.set_active(False)
+            self._led_mic.frame.pack_forget()
+            self._led_system.frame.pack_forget()
+        except Exception:
+            pass
+
     def show_toast(self, kind: str, text: str) -> None:
         """Show the toast banner with *text* and styling for *kind*.
 
@@ -302,7 +427,6 @@ class LiveTab:
         Must be called from T1 — uses ``self._root.after()`` for scheduling.
         Cancels any pending auto-hide from a previous toast (ADR-4).
         """
-        # Cancel any pending hide from a previous toast
         if self._toast_after_id is not None:
             try:
                 self._root.after_cancel(self._toast_after_id)  # type: ignore[union-attr]
@@ -315,7 +439,7 @@ class LiveTab:
             self._toast_label.configure(text=text)
             self._toast_frame.configure(fg_color=bg)
             self._toast_frame.pack(
-                fill="x", padx=0, pady=(0, 4), before=self._timer_label
+                fill="x", padx=0, pady=(0, 4), before=self._heading_label
             )
         except Exception as exc:
             log.warning("[LIVE] show_toast configure/pack failed: %s", exc)
@@ -355,6 +479,7 @@ class LiveTab:
         self._is_recording = is_recording
         if is_recording:
             self.apply_app_state(AppState.RECORDING)
+            self.apply_pill(AppState.RECORDING)
         else:
             self.apply_app_state(AppState.IDLE)
             self._timer_label.configure(text="00:00:00")
@@ -377,11 +502,12 @@ class LiveTab:
         self._text.mark_set(_PARTIAL_MARK_START, "end")
         self._text.mark_set(_PARTIAL_MARK_END, "end")
         self._text.config(state="disabled")
+        self._show_empty_state()
 
     def show_lemonade_banner(self) -> None:
         """Show the Lemonade-unreachable banner. MUST be on T1."""
         self._lemonade_banner_frame.pack(
-            fill="x", padx=0, pady=(0, 4), before=self._timer_label
+            fill="x", padx=0, pady=(0, 4), before=self._heading_label
         )
 
     def hide_lemonade_banner(self) -> None:
@@ -399,12 +525,7 @@ class LiveTab:
                 log.warning("[LIVE] on_open_settings callback raised: %s", exc)
 
     def show_capture_warning(self, mic_name: str, loopback_name: str) -> None:
-        """Show the silent-capture banner naming the currently-selected devices.
-
-        Called by the orchestrator after N consecutive recordings captured
-        pure silence — tells the user the app is alive but listening to the
-        wrong endpoint, and points them at Settings.
-        """
+        """Show the silent-capture banner naming the currently-selected devices."""
         mic = mic_name or "Windows default mic"
         loop = loopback_name or "Windows default loopback"
         self._capture_warning_label.configure(
@@ -415,7 +536,7 @@ class LiveTab:
             )
         )
         self._capture_warning_frame.pack(
-            fill="x", padx=0, pady=(0, 4), before=self._timer_label
+            fill="x", padx=0, pady=(0, 4), before=self._heading_label
         )
 
     def hide_capture_warning(self) -> None:
@@ -446,11 +567,83 @@ class LiveTab:
         try:
             if kind == RenderKind.REPLACE_PARTIAL:
                 self._replace_partial(text)
+                self._hide_empty_state()
             elif kind == RenderKind.FINALIZE_AND_NEWLINE:
                 self._finalize_and_newline(text)
+                self._hide_empty_state()
         finally:
             self._text.config(state="disabled")
             self._text.see("end")
+
+    # ------------------------------------------------------------------
+    # Internal — empty-state swap (R5)
+    # ------------------------------------------------------------------
+
+    def _show_empty_state(self) -> None:
+        """Show empty-state label, hide captions textbox."""
+        if self._captions_empty:
+            return
+        self._captions_empty = True
+        try:
+            self._text.pack_forget()
+            self._empty_state_label.pack(fill="both", expand=True)
+        except Exception:
+            pass
+
+    def _hide_empty_state(self) -> None:
+        """Hide empty-state label, show captions textbox."""
+        if not self._captions_empty:
+            return
+        self._captions_empty = False
+        try:
+            self._empty_state_label.pack_forget()
+            self._text.pack(fill="both", expand=True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Internal — LED polling (ADR-2, TI-2)
+    # ------------------------------------------------------------------
+
+    def _schedule_led_tick(self) -> None:
+        """Schedule the next LED tick on T1 via after()."""
+        if not self._led_polling or self._root is None:
+            return
+        from ui import theme
+
+        try:
+            self._led_after_id = self._root.after(  # type: ignore[union-attr]
+                theme.LED_POLL_MS, self._tick_led
+            )
+        except Exception as exc:
+            log.warning("[LIVE] LED poll schedule failed: %s", exc)
+
+    def _tick_led(self) -> None:
+        """Single LED poll tick — runs on T1 via after() (TI-2).
+
+        Reads per-source RMS from RecordingService (lock-free, ADR-1),
+        compares to SILENCE_RMS_THRESHOLD, and updates LEDs.
+        """
+        if not self._led_polling:
+            return
+
+        try:
+            from audio_recorder import SILENCE_RMS_THRESHOLD
+
+            mic_rms, loop_rms = 0.0, 0.0
+            if self._recording_svc is not None:
+                try:
+                    mic_rms, loop_rms = self._recording_svc.get_source_peaks()
+                except Exception:
+                    pass
+
+            self._led_mic.set_active(mic_rms >= SILENCE_RMS_THRESHOLD)
+            self._led_system.set_active(loop_rms >= SILENCE_RMS_THRESHOLD)
+        except Exception as exc:
+            log.warning("[LIVE] LED tick error: %s", exc)
+
+        # Reschedule for next tick
+        self._schedule_led_tick()
 
     # ------------------------------------------------------------------
     # Internal — text widget mutations
@@ -461,17 +654,14 @@ class LiveTab:
         start = _PARTIAL_MARK_START
         end = _PARTIAL_MARK_END
 
-        # Delete existing partial content
         try:
             self._text.delete(start, end)
         except tk.TclError:
             pass
 
-        # Insert new partial text with the partial tag
         insert_pos = self._text.index(start)
         self._text.insert(insert_pos, text, ("partial",))
 
-        # Update the end mark to encompass the new text
         new_end = self._text.index(f"{insert_pos}+{len(text)}c")
         self._text.mark_set(end, new_end)
 
@@ -480,7 +670,6 @@ class LiveTab:
         start = _PARTIAL_MARK_START
         end = _PARTIAL_MARK_END
 
-        # Replace partial content with the definitive completed text
         try:
             self._text.delete(start, end)
         except tk.TclError:
@@ -489,11 +678,9 @@ class LiveTab:
         insert_pos = self._text.index(start)
         self._text.insert(insert_pos, text, ("final",))
 
-        # Advance end mark past the just-inserted final text
         final_end = self._text.index(f"{insert_pos}+{len(text)}c")
         self._text.mark_set(end, final_end)
 
-        # Move partial marks to after the final text + newline
         self._text.insert(final_end, "\n")
         after_newline = self._text.index(f"{final_end}+1c")
         self._text.mark_set(start, after_newline)
@@ -512,8 +699,7 @@ class LiveTab:
                 log.warning("[LIVE] on_toggle_recording callback raised: %s", exc)
 
     def _on_capture_warning_dismissed(self) -> None:
-        """Banner Dismiss button — hide it and notify the orchestrator so it
-        can reset its silent-recording counter and re-enable auto-rearm."""
+        """Banner Dismiss button — hide it and notify the orchestrator."""
         self.hide_capture_warning()
         if self._on_dismiss_capture_warning is not None:
             try:

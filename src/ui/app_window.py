@@ -14,7 +14,7 @@ Window title ``"MeetingRecorder"`` is stable across releases so
 Close [X] behaviour: withdraw (hide to tray) — not quit.
 Quit is only via tray menu "Quit" item.
 
-Minimum size: 520 × 360 per DEFINE §1.
+Minimum size: 900 × 560 per ADR-9.
 
 Threading contract
 ------------------
@@ -32,8 +32,10 @@ from typing import Callable
 log = logging.getLogger(__name__)
 
 WINDOW_TITLE = "MeetingRecorder"
-MIN_W = 520
-MIN_H = 360
+DEFAULT_W = 900
+DEFAULT_H = 560
+MIN_W = DEFAULT_W  # alias — keeps minsize() / geometry() calls below working
+MIN_H = DEFAULT_H  # alias
 
 
 class AppWindow:
@@ -73,18 +75,20 @@ class AppWindow:
         on_retranscribe: Callable[[Path], None] | None = None,
         on_delete_entry: Callable[[Path, "Path | None"], None] | None = None,
         on_dismiss_capture_warning: Callable[[], None] | None = None,
+        on_rename_entry: "Callable[[object, str], None] | None" = None,
     ) -> None:
         import customtkinter as ctk
 
         self._on_quit = on_quit
         self._config = config
         self._get_last_save_result = get_last_save_result
+        self._on_rename_entry = on_rename_entry
 
         # Build the main CTk window
         self._root = ctk.CTk()
         self._root.title(WINDOW_TITLE)
         self._root.minsize(MIN_W, MIN_H)
-        self._root.geometry(f"{MIN_W}x{MIN_H}")
+        self._root.geometry(f"{DEFAULT_W}x{DEFAULT_H}")
         self._root.resizable(True, True)
 
         # Hide to tray on [X], never destroy
@@ -120,6 +124,7 @@ class AppWindow:
             vault_dir=config.vault_dir if config else None,
             on_retranscribe=on_retranscribe,
             on_delete=on_delete_entry,
+            on_rename=on_rename_entry,
         )
         self._settings_tab = SettingsTab(
             tab_settings,
@@ -205,25 +210,35 @@ class AppWindow:
         from app.state import AppState
 
         if new is AppState.RECORDING:
-            # Bring the window out of the tray so the user actually sees
-            # that recording has started. Without this the app "silently"
-            # records while hidden, giving the appearance that nothing
-            # happened when the user joined a call.
-            self.show()
+            # FR34: do NOT call self.show() here — quiet detection means the
+            # window must stay hidden when recording auto-starts.  The user
+            # can open the window via the tray toast or tray icon left-click.
             self._tabview.set("Live")
             self._live_tab.clear_captions()
             self._live_tab.set_recording(True)
             self._live_tab.set_status("Recording...")
             # SC-5: hide any lingering toast when a new session begins
             self._live_tab._hide_toast()
+            # Start LED polling (ADR-2) — will be stopped when leaving RECORDING
+            self._live_tab.start_led_poll()
 
         elif new is AppState.SAVING:
             self._live_tab.set_recording(False)
             self._live_tab.set_status("Saving...")
+            self._live_tab.stop_led_poll()
+            self._live_tab.apply_pill(new)
 
         elif new is AppState.ARMED:
             self._live_tab.set_recording(False)
             self._live_tab.set_status("Armed — waiting for mic activity")
+            # Show SAVED pill if we just finished a successful save (FR14)
+            if old is AppState.IDLE and self._get_last_save_result is not None:
+                try:
+                    result = self._get_last_save_result()
+                    if result is not None and result.kind == "success":
+                        self._live_tab.set_pill_saved()
+                except Exception as exc:
+                    log.warning("[APP_WINDOW] set_pill_saved on ARMED failed: %s", exc)
 
         elif new is AppState.IDLE:
             self._live_tab.set_recording(False)

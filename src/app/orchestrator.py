@@ -59,6 +59,14 @@ _DEFAULT_ICON = Path(__file__).parent.parent.parent / "assets" / "SaveLC.ico"
 # is almost certainly Whisper hallucination on near-silent input.
 _MIN_TRANSCRIPT_CHARS = 30
 
+# ---------------------------------------------------------------------------
+# Tray toast constants (FR1-FR4, NFR6)
+# ---------------------------------------------------------------------------
+
+_TOAST_TITLE: str = "MeetingRecorder"
+_TOAST_BODY_RECORDING: str = "Recording started \u2014 open to view captions"
+_TOAST_BODY_SAVED: str = "Saved -> {name}"
+
 # Consecutive silent-filtered recordings before we stop auto-rearming and
 # surface the capture-warning banner. With a 30 s silence-autostop, 4 cycles
 # = ~2 minutes of pure dead air before we assume the audio endpoint is wrong
@@ -269,6 +277,7 @@ class Orchestrator:
             on_retranscribe=self._on_retranscribe,
             on_delete_entry=self._on_delete_entry,
             on_dismiss_capture_warning=self._on_dismiss_capture_warning,
+            on_rename_entry=self._on_history_rename,
         )
 
         # Wire CaptionRouter → live_tab
@@ -326,6 +335,9 @@ class Orchestrator:
             on_quit=lambda: dispatch(self._on_quit),
             dispatch=dispatch,
         )
+
+        # Wire RecordingService into LiveTab for LED polling (ADR-2)
+        self._window.live_tab.set_recording_svc(self._recording_svc)  # type: ignore[attr-defined]
 
         # Start background services
         self._mic_watcher.start()  # type: ignore[attr-defined]
@@ -531,6 +543,36 @@ class Orchestrator:
         self._tray_svc.set_recording_state(True)  # type: ignore[attr-defined]
         self._start_timer()
 
+        # FR1-FR3: tray toast — best-effort, non-blocking (TI-3).
+        # on_click is an already-marshalled closure; TrayService stores it
+        # for the left-click fallback path (ADR-3, TI-4).
+        try:
+            self._tray_svc.notify(  # type: ignore[attr-defined]
+                _TOAST_TITLE,
+                _TOAST_BODY_RECORDING,
+                on_click=self._on_toast_clicked,
+            )
+        except Exception as exc:
+            log.warning("[ORCH] tray.notify(recording) failed (non-fatal): %s", exc)
+
+    def _on_toast_clicked(self) -> None:
+        """Invoked when the user activates the recording-started toast.
+
+        Dispatches show+switch_tab to T1 (Critical Rule #2 / TI-4).
+        The callable itself is already on T1 when called from the tray
+        left-click fallback, but dispatch() is idempotent so wrapping it
+        again is safe.
+        """
+        try:
+            self._window.dispatch(  # type: ignore[attr-defined]
+                lambda: (
+                    self._window.show(),  # type: ignore[attr-defined]
+                    self._window.switch_tab("Live"),  # type: ignore[attr-defined]
+                )
+            )
+        except Exception as exc:
+            log.warning("[ORCH] _on_toast_clicked dispatch failed: %s", exc)
+
     def _stop_recording(self) -> None:
         """Transition RECORDING → SAVING, stop all recording/streaming."""
         from app.state import AppState
@@ -727,6 +769,14 @@ class Orchestrator:
         self._publish_save_result(
             ToastKind.SUCCESS, f"Recording saved \u2192 {md_path.name}"
         )
+        # FR4: tray save-toast — SUCCESS only; NEUTRAL/ERROR are silent.
+        try:
+            self._tray_svc.notify(  # type: ignore[attr-defined]
+                _TOAST_TITLE,
+                _TOAST_BODY_SAVED.format(name=md_path.name),
+            )
+        except Exception as exc:
+            log.warning("[ORCH] tray.notify(saved) failed (non-fatal): %s", exc)
         # Clean capture — reset the safety-net counter and clear any banner
         # the user may have left up from a previous misconfiguration.
         self._consecutive_silent_filtered = 0
@@ -949,6 +999,92 @@ class Orchestrator:
         # Refresh history list
         entries = self._history_index.list()
         self._window.history_tab.render_entries(entries)  # type: ignore[attr-defined]
+
+    def _on_history_rename(self, entry: object, new_title: str) -> None:
+        """Rename the .md (and .wav if present) for *entry* to *new_title*.
+
+        Called on T1 (TI-5). Uses paired rename with rollback (ADR-8, R7):
+        1. Rename .md → new path derived from new_title.
+        2. If .wav exists, rename it to match.
+        3. On any OSError in step 2, attempt to roll back step 1.
+        4. Update HistoryIndex and refresh the History tab.
+
+        Surfaces failure via the History tab status label.
+        """
+        from app.services.history_index import HistoryEntry
+
+        old_md: Path = getattr(entry, "path", None)
+        old_wav: "Path | None" = getattr(entry, "wav_path", None)
+        if old_md is None:
+            return
+
+        # Sanitise new title to a safe filename (strip leading/trailing
+        # dots/spaces; replace path separators)
+        safe_title = new_title.strip().replace("/", "_").replace("\\", "_")
+        if not safe_title:
+            return
+
+        new_md = old_md.with_name(f"{safe_title}{old_md.suffix}")
+        if new_md == old_md:
+            return  # nothing to do
+
+        # Step 1: rename .md
+        try:
+            old_md.rename(new_md)
+        except OSError as exc:
+            log.error("[ORCH] Rename .md failed: %s", exc)
+            try:
+                self._window.history_tab.set_status(  # type: ignore[attr-defined]
+                    f"Rename failed: {exc}"
+                )
+            except Exception:
+                pass
+            return
+
+        # Step 2: rename .wav
+        new_wav: "Path | None" = None
+        if old_wav is not None and old_wav.exists():
+            new_wav = old_wav.with_name(f"{safe_title}{old_wav.suffix}")
+            try:
+                old_wav.rename(new_wav)
+            except OSError as exc:
+                log.error("[ORCH] Rename .wav failed (%s) — rolling back .md", exc)
+                try:
+                    new_md.rename(old_md)
+                except OSError as rb_exc:
+                    log.error("[ORCH] Rollback .md rename also failed: %s", rb_exc)
+                try:
+                    self._window.history_tab.set_status(  # type: ignore[attr-defined]
+                        f"Rename failed: {exc}"
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            new_wav = old_wav  # preserve None or a path that no longer matters
+
+        # Step 3: update index
+        new_entry = HistoryEntry(
+            path=new_md,
+            title=safe_title,
+            started_at=getattr(entry, "started_at", ""),
+            duration_s=getattr(entry, "duration_s", None),
+            wav_path=new_wav,
+        )
+        try:
+            self._history_index.update(old_md, new_entry)
+        except Exception as exc:
+            log.warning("[ORCH] History index update after rename failed: %s", exc)
+
+        # Step 4: refresh tab
+        try:
+            self._window.history_tab.render_entries(  # type: ignore[attr-defined]
+                self._history_index.list()
+            )
+        except Exception as exc:
+            log.warning("[ORCH] History tab refresh after rename failed: %s", exc)
+
+        log.info("[ORCH] Renamed: %s -> %s", old_md.name, new_md.name)
 
     def _on_retranscribe(self, wav_path: Path) -> None:
         """Start a background re-transcription job."""

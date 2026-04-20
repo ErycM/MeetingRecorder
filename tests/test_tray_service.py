@@ -310,8 +310,9 @@ class TestIdempotency:
                 super().__init__(*args, **kwargs)
                 icon_create_count["n"] += 1
 
-            def run(self):
-                # Block long enough for the second start() to see _running=True
+            def run(self, *args, **kwargs):
+                # Block long enough for the second start() to see _running=True.
+                # Accepts **kwargs to match pystray.Icon.run(setup=...) signature.
                 import time
 
                 time.sleep(0.2)
@@ -328,3 +329,74 @@ class TestIdempotency:
 
         assert icon_create_count["n"] == 1, "pystray.Icon created more than once"
         service.stop()
+
+
+# ---------------------------------------------------------------------------
+# notify() — ADR-3 toast + pending-click fallback
+# ---------------------------------------------------------------------------
+
+
+class FakeIconWithNotify(FakeIcon):
+    """FakeIcon that records notify() calls."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._notify_calls: list[tuple[str, str]] = []
+
+    def notify(self, body: str, title: str) -> None:
+        self._notify_calls.append((body, title))
+
+
+class TestNotify:
+    def test_notify_stores_pending_toast_click(self, svc):
+        """notify() with on_click stores the callback in _pending_toast_click."""
+        service, _ = svc
+        cb = MagicMock()
+
+        service.notify("Title", "Body", on_click=cb)
+
+        assert service._pending_toast_click is cb
+
+    def test_notify_without_icon_is_noop(self, svc):
+        """notify() before icon is started does not raise."""
+        service, _ = svc
+        assert service._icon is None
+
+        service.notify("Title", "Body", on_click=None)  # must not raise
+
+    def test_notify_sends_to_pystray_icon_when_started(self, svc, icon_path):
+        """notify() calls icon.notify(body, title) when the icon is running."""
+        service, _ = svc
+
+        # Manually assign a fake icon that records notify calls
+        fake_icon = FakeIconWithNotify(
+            "MeetingRecorder", FakeImage(), "MeetingRecorder"
+        )
+        service._icon = fake_icon
+        # Simulate the pystray setup-callback having fired (icon registered
+        # with the Windows shell). Without this, notify() queues rather than
+        # dispatching — see TrayService._icon_ready gate.
+        service._icon_ready.set()
+
+        service.notify("Recording started", "MeetingRecorder")
+
+        assert len(fake_icon._notify_calls) == 1
+        body, title = fake_icon._notify_calls[0]
+        assert title == "Recording started"
+        assert body == "MeetingRecorder"
+
+    def test_show_window_consumes_pending_toast_click(self, svc):
+        """When _pending_toast_click is set, Show-Window action invokes it and clears it."""
+        service, dispatched = svc
+        cb = MagicMock()
+        service._pending_toast_click = cb
+
+        menu = service._build_menu(FakePystray)
+        show_item = menu.items[0]
+        fake_icon = FakeIcon("MeetingRecorder", FakeImage(), "MeetingRecorder")
+        show_item.action(fake_icon, show_item)
+
+        # The pending callback was dispatched (not the generic show_window callback)
+        cb.assert_called_once()
+        # And it was cleared
+        assert service._pending_toast_click is None

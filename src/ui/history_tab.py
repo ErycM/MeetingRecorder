@@ -2,10 +2,12 @@
 HistoryTab — customtkinter frame listing recent transcripts with actions.
 
 Contents:
-- Scrollable list of up to 20 history entries (title, timestamp, duration).
-- Left-click: open the .md file (obsidian:// URI or os.startfile).
-- Right-click context menu: Reveal in Explorer, Delete (confirmation),
-  Re-transcribe.
+- Search box (FR20) with 120 ms debounce (FR21, TI-6, OQ-D3).
+- CTkScrollableFrame with date-grouped section headers (FR22-FR23).
+- HistoryRow widgets per entry — 4 inline action buttons (FR27).
+- Broken-row chip (FR25) via HistoryRow.broken parameter.
+- Right-click context menu retained for back-compat (FR28).
+- 20-cap on default list(); full list when search active (FR29, SC-11).
 
 Reconciliation
 --------------
@@ -17,6 +19,7 @@ Threading contract
 ------------------
 All UI mutations happen on T1.  The reconcile worker (T8) only calls
 ``dispatch(fn)`` — it never touches tkinter directly.
+Search debounce runs entirely on T1 via after() (TI-6).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import os
 import subprocess
 import sys
 import threading
+import tkinter as tk
 from pathlib import Path
 from typing import Callable
 
@@ -39,7 +43,6 @@ def _open_path(path: Path, vault_dir: Path | None = None) -> None:
     if sys.platform != "win32":
         return
     try:
-        # Prefer obsidian:// when the vault has the .obsidian marker
         if vault_dir is not None and (vault_dir / _OBSIDIAN_MARKER).exists():
             rel = path.relative_to(vault_dir)
             vault_name = vault_dir.name
@@ -82,6 +85,8 @@ class HistoryTab:
     on_delete:
         Called with ``(md_path: Path, wav_path: Path | None)`` when Delete
         is confirmed.
+    on_rename:
+        Called with ``(entry, new_title: str)`` when Rename is confirmed.
     """
 
     def __init__(
@@ -93,9 +98,9 @@ class HistoryTab:
         vault_dir: Path | None = None,
         on_retranscribe: Callable[[Path], None] | None = None,
         on_delete: Callable[[Path, "Path | None"], None] | None = None,
+        on_rename: "Callable[[object, str], None] | None" = None,
     ) -> None:
         import customtkinter as ctk
-        import tkinter as tk
         from ui import theme
 
         self._history_index = history_index
@@ -103,8 +108,13 @@ class HistoryTab:
         self._vault_dir = vault_dir
         self._on_retranscribe = on_retranscribe
         self._on_delete = on_delete
+        self._on_rename = on_rename
         self._entries: list = []
         self._reconcile_debounce: str | None = None  # after() id
+
+        # Search debounce state (TI-6)
+        self._search_after_id: object = None
+        self._pending_query: str = ""
 
         self.frame = ctk.CTkFrame(parent)
         self.frame.pack(fill="both", expand=True, padx=theme.PAD_X, pady=theme.PAD_Y)
@@ -118,37 +128,25 @@ class HistoryTab:
         )
         header.pack(fill="x", padx=theme.PAD_INNER, pady=(theme.PAD_INNER, 4))
 
-        # Listbox in a frame with scrollbar
-        list_frame = ctk.CTkFrame(self.frame)
-        list_frame.pack(fill="both", expand=True, padx=0, pady=(0, theme.PAD_INNER))
-
-        self._listbox = tk.Listbox(
-            list_frame,
-            bg="#1a1a2e",
-            fg=theme.FINAL_FG,
-            selectbackground="#3a3a5e",
-            selectforeground=theme.FINAL_FG,
-            font=theme.FONT_LABEL,
-            relief="flat",
-            bd=0,
-            activestyle="none",
-            highlightthickness=0,
+        # Search box (FR20, OQ-D3)
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", self._on_search_changed)
+        self._search_entry = ctk.CTkEntry(
+            self.frame,
+            textvariable=self._search_var,
+            placeholder_text="Search...",
         )
-        scrollbar = tk.Scrollbar(list_frame, orient="vertical")
-        self._listbox.configure(yscrollcommand=scrollbar.set)
-        scrollbar.configure(command=self._listbox.yview)
+        self._search_entry.pack(fill="x", padx=theme.PAD_INNER, pady=(0, 4))
 
-        scrollbar.pack(side="right", fill="y")
-        self._listbox.pack(side="left", fill="both", expand=True)
+        # Scrollable list frame (replaces old tk.Listbox)
+        self._scroll_frame = ctk.CTkScrollableFrame(self.frame)
+        self._scroll_frame.pack(
+            fill="both", expand=True, padx=0, pady=(0, theme.PAD_INNER)
+        )
 
-        # Bind interactions
-        self._listbox.bind("<Double-Button-1>", self._on_double_click)
-        self._listbox.bind("<Button-3>", self._on_right_click)
-        if sys.platform == "darwin":
-            self._listbox.bind("<Button-2>", self._on_right_click)
-
-        # Context menu (lazy-built on first right-click)
+        # Right-click context menu (lazy-built; FR28 back-compat)
         self._context_menu: tk.Menu | None = None
+        self._context_entry: object | None = None  # entry under right-click
 
         # Status label
         self._status = ctk.CTkLabel(
@@ -162,6 +160,13 @@ class HistoryTab:
     # ------------------------------------------------------------------
     # Public API — all called from T1
     # ------------------------------------------------------------------
+
+    def set_status(self, text: str) -> None:
+        """Update the status label (e.g. error messages)."""
+        try:
+            self._status.configure(text=text)
+        except Exception:
+            pass
 
     def update_vault_dir(self, vault_dir: Path | None) -> None:
         """Update vault directory for obsidian:// URI detection."""
@@ -191,109 +196,154 @@ class HistoryTab:
     # ------------------------------------------------------------------
 
     def _render(self, entries: list) -> None:
+        """Render *entries* into the scrollable frame with date grouping."""
+        import customtkinter as ctk
+        from app.services.history_index import HistoryIndex
+        from ui import theme
+        from ui.widgets.history_row import HistoryRow
+
         self._entries = entries
-        self._listbox.delete(0, "end")
-        for entry in entries:
-            display = self._format_entry(entry)
-            self._listbox.insert("end", display)
-        count = len(entries)
-        self._status.configure(
-            text=f"{count} meeting(s)" if count else "No meetings yet"
-        )
 
-    def _format_entry(self, entry: object) -> str:
-        title = getattr(entry, "title", "") or "Untitled"
-        started = getattr(entry, "started_at", "") or ""
-        duration = getattr(entry, "duration_s", None)
-        if started:
+        # Clear existing widgets
+        for widget in self._scroll_frame.winfo_children():
             try:
-                # Show compact date-time from ISO8601
-                dt_str = started[:16].replace("T", " ")
+                widget.destroy()
             except Exception:
-                dt_str = started[:16]
-        else:
-            dt_str = "?"
-        dur_str = ""
-        if duration is not None:
-            m = int(duration) // 60
-            s = int(duration) % 60
-            dur_str = f"  [{m}:{s:02d}]"
-        return f"{dt_str}{dur_str}  {title}"
+                pass
 
-    # ------------------------------------------------------------------
-    # Internal — click handlers
-    # ------------------------------------------------------------------
-
-    def _selected_entry(self) -> object | None:
-        sel = self._listbox.curselection()
-        if not sel:
-            return None
-        idx = sel[0]
-        if idx < len(self._entries):
-            return self._entries[idx]
-        return None
-
-    def _on_double_click(self, event: object) -> None:
-        entry = self._selected_entry()
-        if entry is None:
+        if not entries:
+            ctk.CTkLabel(
+                self._scroll_frame,
+                text="No meetings yet",
+                font=theme.FONT_STATUS,
+                text_color="#555555",
+            ).pack(pady=8)
+            self._status.configure(text="No meetings yet")
             return
+
+        # Group by date (ADR-5, FR22)
+        groups = HistoryIndex.group_by_date(entries)
+
+        for header_text, group_entries in groups:
+            # Section header (FR22)
+            ctk.CTkLabel(
+                self._scroll_frame,
+                text=header_text,
+                font=theme.SECTION_HEADER_FONT,
+                anchor="w",
+                text_color="#aaaaaa",
+            ).pack(fill="x", padx=theme.PAD_INNER, pady=(6, 2))
+
+            for entry in group_entries:
+                # Determine broken status (FR24)
+                try:
+                    broken = HistoryIndex.is_broken(entry, vault_dir=self._vault_dir)
+                except Exception:
+                    broken = False
+
+                # Capture loop variable
+                _entry = entry
+                row = HistoryRow(
+                    self._scroll_frame,
+                    _entry,
+                    vault_dir=self._vault_dir,
+                    broken=broken,
+                    on_open_md=lambda e=_entry: self._open_md(e),
+                    on_open_wav=lambda e=_entry: self._open_wav(e),
+                    on_rename=lambda e=_entry: self._rename(e),
+                    on_delete=lambda e=_entry: self._confirm_delete(e),
+                )
+                row.frame.pack(
+                    fill="x",
+                    padx=theme.PAD_INNER,
+                    pady=1,
+                )
+                # Right-click on row title label (FR28 back-compat)
+                try:
+                    row._title_label.bind(
+                        "<Button-3>",
+                        lambda event, e=_entry: self._on_right_click(event, e),
+                    )
+                    if sys.platform == "darwin":
+                        row._title_label.bind(
+                            "<Button-2>",
+                            lambda event, e=_entry: self._on_right_click(event, e),
+                        )
+                except Exception:
+                    pass
+
+        count = len(entries)
+        self._status.configure(text=f"{count} meeting(s)")
+
+    # ------------------------------------------------------------------
+    # Internal — search debounce (TI-6, FR21)
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self, *_args: object) -> None:
+        """StringVar trace callback — schedule a debounced filter (TI-6)."""
+        self._pending_query = self._search_var.get()
+        if self._search_after_id is not None:
+            try:
+                self._scroll_frame.after_cancel(self._search_after_id)
+            except Exception:
+                pass
+        try:
+            self._search_after_id = self._scroll_frame.after(120, self._apply_filter)
+        except Exception as exc:
+            log.warning("[HISTORY] Search debounce after() failed: %s", exc)
+
+    def _apply_filter(self) -> None:
+        """Apply the current search query and re-render (TI-6, FR20-FR21)."""
+        self._search_after_id = None
+        query = self._pending_query.strip().lower()
+
+        if not query:
+            # Empty query: use the capped list() (FR29, SC-11)
+            entries = self._history_index.list()
+        else:
+            # Non-empty: search over full list (FR29 SC-11 "older entries")
+            all_entries = self._history_index.list_all()
+            entries = [
+                e
+                for e in all_entries
+                if query in (getattr(e, "title", "") or "").lower()
+                or query in (getattr(e, "started_at", "") or "").lower()
+            ]
+
+        self._render(entries)
+
+    # ------------------------------------------------------------------
+    # Internal — row actions
+    # ------------------------------------------------------------------
+
+    def _open_md(self, entry: object) -> None:
         path = getattr(entry, "path", None)
         if path is not None:
             _open_path(path, self._vault_dir)
 
-    def _on_right_click(self, event: object) -> None:
-        import tkinter as tk
+    def _open_wav(self, entry: object) -> None:
+        wav = getattr(entry, "wav_path", None)
+        if wav is not None and wav.exists():
+            _open_path(wav, None)
 
-        # Select item under cursor
-        self._listbox.selection_clear(0, "end")
-        try:
-            idx = self._listbox.nearest(getattr(event, "y", 0))
-            if idx >= 0:
-                self._listbox.selection_set(idx)
-        except Exception:
-            pass
+    def _rename(self, entry: object) -> None:
+        """Show rename dialog and fire on_rename callback (ADR-8 revised).
 
-        entry = self._selected_entry()
-        if entry is None:
-            return
+        Uses CTkInputDialog for visual consistency with the rest of the UI.
+        Pre-populate is not supported by CTkInputDialog — user re-types the name.
+        Returns None on cancel (same semantics as the old askstring path).
+        """
+        import customtkinter as ctk
 
-        # Build or rebuild context menu
-        if self._context_menu is not None:
-            try:
-                self._context_menu.destroy()
-            except Exception:
-                pass
-
-        self._context_menu = tk.Menu(self._listbox, tearoff=False)
-        self._context_menu.add_command(
-            label="Open",
-            command=lambda e=entry: _open_path(
-                getattr(e, "path", None), self._vault_dir
-            ),
-        )
-        self._context_menu.add_command(
-            label="Reveal in Explorer",
-            command=lambda e=entry: _reveal_in_explorer(getattr(e, "path", None)),
-        )
-        self._context_menu.add_separator()
-        self._context_menu.add_command(
-            label="Delete",
-            command=lambda e=entry: self._confirm_delete(e),
-        )
-        self._context_menu.add_command(
-            label="Re-transcribe",
-            command=lambda e=entry: self._retranscribe(e),
-        )
-
-        try:
-            self._context_menu.tk_popup(
-                getattr(event, "x_root", 0), getattr(event, "y_root", 0)
-            )
-        finally:
-            try:
-                self._context_menu.grab_release()
-            except Exception:
-                pass
+        current_title = getattr(entry, "title", "") or ""
+        dialog = ctk.CTkInputDialog(text="New name:", title="Rename transcript")
+        new_title = dialog.get_input()
+        if new_title and new_title.strip() and new_title.strip() != current_title:
+            if self._on_rename is not None:
+                try:
+                    self._on_rename(entry, new_title.strip())
+                except Exception as exc:
+                    log.error("[HISTORY] on_rename callback raised: %s", exc)
 
     def _confirm_delete(self, entry: object) -> None:
         import tkinter.messagebox as mb
@@ -314,6 +364,52 @@ class HistoryTab:
         )
         if confirmed and self._on_delete is not None:
             self._on_delete(md_path, wav_path)
+
+    # ------------------------------------------------------------------
+    # Internal — right-click context menu (FR28 back-compat)
+    # ------------------------------------------------------------------
+
+    def _on_right_click(self, event: object, entry: object) -> None:
+        self._context_entry = entry
+
+        if self._context_menu is not None:
+            try:
+                self._context_menu.destroy()
+            except Exception:
+                pass
+
+        self._context_menu = tk.Menu(self._scroll_frame, tearoff=False)
+        self._context_menu.add_command(
+            label="Open",
+            command=lambda e=entry: self._open_md(e),
+        )
+        self._context_menu.add_command(
+            label="Reveal in Explorer",
+            command=lambda e=entry: _reveal_in_explorer(getattr(e, "path", Path("."))),
+        )
+        self._context_menu.add_separator()
+        self._context_menu.add_command(
+            label="Rename",
+            command=lambda e=entry: self._rename(e),
+        )
+        self._context_menu.add_command(
+            label="Delete",
+            command=lambda e=entry: self._confirm_delete(e),
+        )
+        self._context_menu.add_command(
+            label="Re-transcribe",
+            command=lambda e=entry: self._retranscribe(e),
+        )
+
+        try:
+            self._context_menu.tk_popup(
+                getattr(event, "x_root", 0), getattr(event, "y_root", 0)
+            )
+        finally:
+            try:
+                self._context_menu.grab_release()
+            except Exception:
+                pass
 
     def _retranscribe(self, entry: object) -> None:
         wav_path: Path | None = getattr(entry, "wav_path", None)

@@ -143,6 +143,21 @@ class RecordingService:
         except AttributeError:
             return "", ""
 
+    def get_source_peaks(self) -> tuple[float, float]:
+        """Return ``(mic_rms, loopback_rms)`` from the most-recent writer tick.
+
+        Proxies ``DualAudioRecorder.get_per_source_peaks()``. Returns
+        ``(0.0, 0.0)`` when the recorder is None (before start) or when the
+        underlying recorder is an older version lacking the attribute
+        (back-compat, ADR-1). The LED poller on T1 calls this at 5 Hz.
+        """
+        if self._recorder is None:
+            return 0.0, 0.0
+        try:
+            return self._recorder.get_per_source_peaks()  # type: ignore[attr-defined]
+        except AttributeError:
+            return 0.0, 0.0
+
     def set_stream_sink(self, callback: Callable[[bytes], None] | None) -> None:
         """Store the streaming audio chunk callback and apply it if a
         recorder is already running.
