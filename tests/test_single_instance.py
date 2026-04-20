@@ -32,6 +32,41 @@ _WIN32_ERROR_ALREADY_EXISTS = 183
 _WIN32_NO_ERROR = 0
 
 
+def _singleton_mutex_available() -> bool:
+    """Return True iff the live singleton mutex is NOT already held.
+
+    Used by @windows_live_isolated to skip tests that would fail simply
+    because MeetingRecorder (or a stale handle from a prior run) is
+    currently holding the named mutex. Those tests only validate the live
+    path — the mocked equivalents in TestMutexPath cover the same
+    behavior without requiring an isolated machine.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32api
+        import win32event
+
+        handle = win32event.CreateMutex(None, False, r"Local\MeetingRecorder.SingleInstance")
+        err = win32api.GetLastError()
+        # Release our probe handle immediately so we don't hold it ourselves.
+        if handle:
+            win32api.CloseHandle(handle)
+        return err != _WIN32_ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+windows_live_isolated = pytest.mark.skipif(
+    sys.platform != "win32" or not _singleton_mutex_available(),
+    reason=(
+        "Live singleton mutex already held by another process "
+        "(running app or leftover handle). Mocked equivalents in "
+        "TestMutexPath / TestLockfileFallback cover the same behavior."
+    ),
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -251,28 +286,36 @@ class TestContextManager:
 
 
 # ---------------------------------------------------------------------------
-# Windows-only live tests (skipped on non-Windows)
+# Windows-only live tests — skipped when the mutex is already held
+# (either by a running MeetingRecorder instance or a stale handle).
+# The mocked tests in TestMutexPath / TestLockfileFallback cover the same
+# behavior deterministically; these live tests exist only to catch
+# pywin32 regressions that mocks would miss.
 # ---------------------------------------------------------------------------
 
 
-@windows_only
+@windows_live_isolated
 class TestWindowsLive:
-    def test_live_mutex_first_acquire(self) -> None:
-        """Live: first acquire actually creates the Win32 mutex."""
-        guard = SingleInstance()
-        result = guard.acquire()
-        assert result is True
-        guard.release()
-
-    def test_live_lockfile_written_and_removed(
+    def test_live_mutex_first_acquire_and_lockfile(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """Live: lockfile is written on acquire and removed on release."""
+        """Live end-to-end: acquire creates mutex + lockfile; release cleans up.
+
+        Requires an isolated mutex (@windows_live_isolated). When the mutex
+        is already held, this whole class is skipped — the mocked paths
+        still run and provide coverage.
+        """
         lockfile = tmp_path / "MeetingRecorder.lock"
         monkeypatch.setenv("TEMP", str(tmp_path))
 
         guard = SingleInstance()
-        guard.acquire()
-        assert lockfile.exists()
-        guard.release()
-        assert not lockfile.exists()
+        try:
+            result = guard.acquire()
+            assert result is True, (
+                "Live acquire returned False despite @windows_live_isolated "
+                "— mutex was taken between the skip-check and acquire()"
+            )
+            assert lockfile.exists(), "Lockfile should be written on acquire"
+        finally:
+            guard.release()
+        assert not lockfile.exists(), "Lockfile should be removed on release"
