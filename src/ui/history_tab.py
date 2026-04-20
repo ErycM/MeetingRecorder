@@ -37,19 +37,98 @@ log = logging.getLogger(__name__)
 
 _OBSIDIAN_MARKER = ".obsidian"
 
+# Max ancestor levels to walk up when auto-detecting the Obsidian vault
+# root. 6 is enough for ``<vault>/raw/meetings/captures/<file>.md`` with
+# room to spare; capped so mis-configured paths can't walk the whole FS.
+_VAULT_ROOT_SEARCH_DEPTH = 6
 
-def _open_path(path: Path, vault_dir: Path | None = None) -> None:
-    """Open *path* via obsidian:// URI or os.startfile fallback."""
+
+def _find_vault_root(start: Path) -> Path | None:
+    """Walk up from *start* looking for a ``.obsidian/`` marker.
+
+    Returns the first ancestor that contains ``.obsidian/``, or None if
+    no Obsidian vault is found within ``_VAULT_ROOT_SEARCH_DEPTH`` levels.
+    """
+    try:
+        current = start if start.is_dir() else start.parent
+    except OSError:
+        return None
+    for _ in range(_VAULT_ROOT_SEARCH_DEPTH):
+        if (current / _OBSIDIAN_MARKER).exists():
+            return current
+        parent = current.parent
+        if parent == current:  # filesystem root
+            break
+        current = parent
+    return None
+
+
+def _resolve_vault_root(
+    path: Path,
+    vault_root: Path | None,
+    vault_dir: Path | None,
+) -> Path | None:
+    """Pick the best Obsidian vault root for *path*.
+
+    Resolution order:
+    1. Explicit ``vault_root`` if it contains ``.obsidian/``.
+    2. Auto-detect by walking up from ``path``.
+    3. Legacy ``vault_dir`` if it contains ``.obsidian/``.
+    4. Auto-detect by walking up from ``vault_dir``.
+    """
+    if vault_root is not None and (vault_root / _OBSIDIAN_MARKER).exists():
+        return vault_root
+    detected = _find_vault_root(path)
+    if detected is not None:
+        return detected
+    if vault_dir is not None and (vault_dir / _OBSIDIAN_MARKER).exists():
+        return vault_dir
+    if vault_dir is not None:
+        return _find_vault_root(vault_dir)
+    return None
+
+
+def _open_path(
+    path: Path,
+    vault_dir: Path | None = None,
+    *,
+    vault_root: Path | None = None,
+) -> None:
+    """Open *path* via ``obsidian://`` URI or ``os.startfile`` fallback.
+
+    Parameters
+    ----------
+    path:
+        The ``.md`` or ``.wav`` file to open.
+    vault_dir:
+        Legacy parameter — historically this was used both as the
+        transcript directory and the Obsidian vault root. Now accepted
+        for backward-compat and only used if ``vault_root`` is unset.
+    vault_root:
+        Explicit Obsidian vault root (the directory containing
+        ``.obsidian/``). When set, takes precedence over auto-detection.
+    """
     if sys.platform != "win32":
         return
     try:
-        if vault_dir is not None and (vault_dir / _OBSIDIAN_MARKER).exists():
-            rel = path.relative_to(vault_dir)
-            vault_name = vault_dir.name
-            uri = f"obsidian://open?vault={vault_name}&file={rel.as_posix()}"
-            log.debug("[HISTORY] Opening via obsidian URI: %s", uri)
-            os.startfile(uri)  # type: ignore[attr-defined]
-            return
+        root = _resolve_vault_root(path, vault_root, vault_dir)
+        if root is not None:
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                # path isn't under the vault — fall through to startfile
+                log.debug(
+                    "[HISTORY] %s is outside vault %s, using startfile",
+                    path.name,
+                    root,
+                )
+            else:
+                uri = (
+                    f"obsidian://open?vault={root.name}&file={rel.as_posix()}"
+                )
+                log.debug("[HISTORY] Opening via obsidian URI: %s", uri)
+                os.startfile(uri)  # type: ignore[attr-defined]
+                return
         log.debug("[HISTORY] Opening via os.startfile: %s", path.name)
         os.startfile(str(path))  # type: ignore[attr-defined]
     except Exception as exc:
@@ -79,7 +158,13 @@ class HistoryTab:
         ``window.after(0, fn)`` equivalent — used to marshal reconcile
         results back to T1.
     vault_dir:
-        Current vault directory (for obsidian:// URI detection).
+        Transcript directory (where ``.md`` files are listed from). Historical
+        name — semantically this is the transcript output directory.
+    vault_root:
+        Obsidian vault root (directory that contains ``.obsidian/``). Used to
+        build ``obsidian://`` URIs so clicks land inside Obsidian instead of
+        the default ``os.startfile()`` handler. If ``None``, the tab
+        auto-detects by walking up from each entry's path.
     on_retranscribe:
         Called with ``(wav_path: Path)`` when Re-transcribe is chosen.
     on_delete:
@@ -96,6 +181,7 @@ class HistoryTab:
         dispatch: Callable[[Callable[[], None]], None],
         *,
         vault_dir: Path | None = None,
+        vault_root: Path | None = None,
         on_retranscribe: Callable[[Path], None] | None = None,
         on_delete: Callable[[Path, "Path | None"], None] | None = None,
         on_rename: "Callable[[object, str], None] | None" = None,
@@ -106,6 +192,7 @@ class HistoryTab:
         self._history_index = history_index
         self._dispatch = dispatch
         self._vault_dir = vault_dir
+        self._vault_root = vault_root
         self._on_retranscribe = on_retranscribe
         self._on_delete = on_delete
         self._on_rename = on_rename
@@ -169,8 +256,17 @@ class HistoryTab:
             pass
 
     def update_vault_dir(self, vault_dir: Path | None) -> None:
-        """Update vault directory for obsidian:// URI detection."""
+        """Update transcript directory used for history reconciliation.
+
+        Historical name (pre-Onda 1.1): used to be the single source of
+        vault info. Kept for backward-compat — prefer
+        :meth:`update_vault_root` for ``obsidian://`` URI resolution.
+        """
         self._vault_dir = vault_dir
+
+    def update_vault_root(self, vault_root: Path | None) -> None:
+        """Update the Obsidian vault root used for ``obsidian://`` URIs."""
+        self._vault_root = vault_root
 
     def trigger_reconcile(self) -> None:
         """Dispatch a background reconcile and refresh the list when done."""
@@ -319,7 +415,7 @@ class HistoryTab:
     def _open_md(self, entry: object) -> None:
         path = getattr(entry, "path", None)
         if path is not None:
-            _open_path(path, self._vault_dir)
+            _open_path(path, self._vault_dir, vault_root=self._vault_root)
 
     def _open_wav(self, entry: object) -> None:
         wav = getattr(entry, "wav_path", None)

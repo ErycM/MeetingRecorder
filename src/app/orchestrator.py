@@ -969,10 +969,13 @@ class Orchestrator:
             self._unregister_hotkey()
             self._register_hotkey(new_hotkey)
 
-        # Update history tab directories (transcript_dir for reconcile,
-        # obsidian_vault_root for obsidian:// URI building — fixed in Onda 1.3)
+        # Update history tab directories: transcript_dir for reconcile,
+        # obsidian_vault_root for obsidian:// URI building.
         self._window.history_tab.update_vault_dir(  # type: ignore[attr-defined]
             getattr(new_config, "transcript_dir", None)
+        )
+        self._window.history_tab.update_vault_root(  # type: ignore[attr-defined]
+            getattr(new_config, "obsidian_vault_root", None)
         )
 
         log.info("[ORCH] Config applied")
