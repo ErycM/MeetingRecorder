@@ -239,6 +239,11 @@ class DualAudioRecorder:
         # these are "current-tick" not "max" values.
         self._peak_mic: float = 0.0
         self._peak_loop: float = 0.0
+        # Per-source running-max RMS (aggregated across the whole recording).
+        # Used by the /meeting triage to classify captures by physical signal
+        # (e.g. mic≈0 + loopback>>0 → media-bleed). Reset at start().
+        self._peak_mic_max: float = 0.0
+        self._peak_loop_max: float = 0.0
         self._last_mic_name: str = ""
         self._last_loopback_name: str = ""
 
@@ -273,6 +278,8 @@ class DualAudioRecorder:
         self._peak_level = 0.0
         self._peak_mic = 0.0
         self._peak_loop = 0.0
+        self._peak_mic_max = 0.0
+        self._peak_loop_max = 0.0
         self._level_chunks = 0
 
         # Clear queues
@@ -395,6 +402,17 @@ class DualAudioRecorder:
         """
         return float(self._peak_mic), float(self._peak_loop)
 
+    def get_per_source_peak_max(self) -> tuple[float, float]:
+        """Return (mic_max, loopback_max) — running max RMS during the session.
+
+        Unlike :meth:`get_per_source_peaks` (current-tick), these aggregate
+        over the whole recording. Used by :meth:`Orchestrator._build_transcript_meta`
+        to populate the Passo B frontmatter fields ``mic_peak`` and
+        ``loopback_peak`` so the /meeting triage can classify by physical
+        signal (silent mic + loud loopback = media-bleed, etc.).
+        """
+        return float(self._peak_mic_max), float(self._peak_loop_max)
+
     def _mic_callback(self, in_data, frame_count, time_info, status):
         import pyaudiowpatch as pyaudio
 
@@ -485,6 +503,12 @@ class DualAudioRecorder:
                 )
                 self._peak_mic = mic_rms
                 self._peak_loop = loop_rms
+                # Running-max per source. Lock-free like the current-tick
+                # writes above (CPython GIL guarantees atomic float assign).
+                if mic_rms > self._peak_mic_max:
+                    self._peak_mic_max = mic_rms
+                if loop_rms > self._peak_loop_max:
+                    self._peak_loop_max = loop_rms
 
                 # Periodic audio-level heartbeat so we can diagnose silent
                 # recordings (mic muted, BT dropout, loopback exclusive

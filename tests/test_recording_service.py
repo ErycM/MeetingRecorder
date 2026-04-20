@@ -491,3 +491,116 @@ class TestGetSourcePeaks:
             svc.stop()
 
         assert result == (0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Passo B (Onda 4.3.1) — stop_reason propagation + per-source peak max
+# ---------------------------------------------------------------------------
+
+
+class FakeRecorderWithPassoB(FakeDualAudioRecorder):
+    """Extended fake that implements the Passo B recorder getter."""
+
+    def __init__(self):
+        super().__init__()
+        self._mic_max = 0.0
+        self._loop_max = 0.0
+
+    def set_peak_max(self, mic: float, loop: float) -> None:
+        self._mic_max = mic
+        self._loop_max = loop
+
+    def get_per_source_peak_max(self) -> tuple[float, float]:
+        return self._mic_max, self._loop_max
+
+
+class TestStopReason:
+    def test_stop_default_reason_is_user_stopped(self, tmp_path: Path) -> None:
+        """stop() without kwarg defaults to 'user-stopped'."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=FakeRecorderWithPassoB()):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            svc.stop()
+
+        assert svc.get_last_stop_reason() == "user-stopped"
+
+    def test_stop_explicit_silence_timeout_reason(self, tmp_path: Path) -> None:
+        """stop(reason='silence-timeout') is surfaced by get_last_stop_reason."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=FakeRecorderWithPassoB()):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            svc.stop(reason="silence-timeout")
+
+        assert svc.get_last_stop_reason() == "silence-timeout"
+
+    def test_stop_app_exit_reason(self, tmp_path: Path) -> None:
+        """stop(reason='app-exit') works for shutdown paths."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=FakeRecorderWithPassoB()):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            svc.stop(reason="app-exit")
+
+        assert svc.get_last_stop_reason() == "app-exit"
+
+    def test_start_resets_previous_reason(self, tmp_path: Path) -> None:
+        """A fresh start() clears any leftover reason from a prior session."""
+        from app.services.recording import RecordingService
+
+        with patch(_RECORDER_PATCH, return_value=FakeRecorderWithPassoB()):
+            svc = RecordingService()
+            svc.start(tmp_path / "one.wav")
+            svc.stop(reason="silence-timeout")
+            assert svc.get_last_stop_reason() == "silence-timeout"
+
+            # New session — reason must reset before next stop() writes it
+            svc.start(tmp_path / "two.wav")
+            assert svc.get_last_stop_reason() is None
+            svc.stop()  # default
+            assert svc.get_last_stop_reason() == "user-stopped"
+
+    def test_get_last_stop_reason_before_any_stop_is_none(self) -> None:
+        from app.services.recording import RecordingService
+
+        svc = RecordingService()
+        assert svc.get_last_stop_reason() is None
+
+
+class TestSourcePeakMax:
+    def test_returns_running_max_from_recorder(self, tmp_path: Path) -> None:
+        from app.services.recording import RecordingService
+
+        fake = FakeRecorderWithPassoB()
+        fake.set_peak_max(0.42, 0.08)
+        with patch(_RECORDER_PATCH, return_value=fake):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            mic_max, loop_max = svc.get_source_peak_max()
+            svc.stop()
+
+        assert mic_max == pytest.approx(0.42)
+        assert loop_max == pytest.approx(0.08)
+
+    def test_returns_zero_when_no_recorder(self) -> None:
+        from app.services.recording import RecordingService
+
+        svc = RecordingService()
+        assert svc.get_source_peak_max() == (0.0, 0.0)
+
+    def test_returns_zero_when_recorder_lacks_method(self, tmp_path: Path) -> None:
+        """Back-compat: older DualAudioRecorder without get_per_source_peak_max."""
+        from app.services.recording import RecordingService
+
+        # FakeDualAudioRecorder (not Passo B) lacks the method
+        with patch(_RECORDER_PATCH, return_value=FakeDualAudioRecorder()):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            result = svc.get_source_peak_max()
+            svc.stop()
+
+        assert result == (0.0, 0.0)
