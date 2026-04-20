@@ -1272,9 +1272,10 @@ class Orchestrator:
     ) -> "TranscriptMetadata":
         """Collect the metadata that's cheaply available at save time.
 
-        Passo A of Onda 1.2 — only the fields that can be read without
-        new instrumentation. Passo B will add mic/loopback peaks, stop
-        reason, source apps, etc.
+        Passo A of Onda 1.2 introduced saved_at/duration_s/whisper_model/peak_mixed.
+        Passo B of Onda 4.3 adds per-source peaks, stop_reason, device
+        names, and derived quality_flags — all sourced from the
+        RecordingService getters introduced in the same wave.
         """
         from datetime import datetime
 
@@ -1290,12 +1291,100 @@ class Orchestrator:
         except Exception:
             peak_mixed = None
 
+        # Passo B: per-source running-max RMS
+        mic_peak: float | None
+        loopback_peak: float | None
+        try:
+            mic_peak, loopback_peak = self._recording_svc.get_source_peak_max()  # type: ignore[attr-defined]
+            mic_peak = float(mic_peak)
+            loopback_peak = float(loopback_peak)
+        except Exception:
+            mic_peak = None
+            loopback_peak = None
+
+        # Passo B: stop reason propagated from RecordingService.stop(reason=...)
+        stop_reason: str | None
+        try:
+            stop_reason = self._recording_svc.get_last_stop_reason()  # type: ignore[attr-defined]
+        except Exception:
+            stop_reason = None
+
+        # Passo B: device names used for the session
+        mic_device: str | None
+        loopback_device: str | None
+        try:
+            mic_name, loop_name = self._recording_svc.get_last_device_names()  # type: ignore[attr-defined]
+            mic_device = str(mic_name) if mic_name else None
+            loopback_device = str(loop_name) if loop_name else None
+        except Exception:
+            mic_device = None
+            loopback_device = None
+
+        # Passo B: derived quality flags for the /meeting triage. Kept as
+        # heuristics (not ML) so they're auditable and predictable.
+        quality_flags = self._derive_quality_flags(
+            peak_mixed=peak_mixed,
+            mic_peak=mic_peak,
+            loopback_peak=loopback_peak,
+            duration_s=duration_s,
+        )
+
         return TranscriptMetadata(
             saved_at=datetime.now().astimezone(),
             duration_s=duration_s,
             whisper_model=whisper_model,
             peak_mixed=peak_mixed,
+            mic_peak=mic_peak,
+            loopback_peak=loopback_peak,
+            stop_reason=stop_reason,
+            mic_device=mic_device,
+            loopback_device=loopback_device,
+            quality_flags=quality_flags,
         )
+
+    @staticmethod
+    def _derive_quality_flags(
+        *,
+        peak_mixed: float | None,
+        mic_peak: float | None,
+        loopback_peak: float | None,
+        duration_s: float | None,
+    ) -> tuple[str, ...]:
+        """Compute human-readable quality flags from the recorded peaks.
+
+        Heuristics documented here must match the triage taxonomy described
+        in CLAUDE.md (/meeting section). Flags:
+
+        - ``silent-mic``: mic_peak < 0.02 — probable wrong endpoint or mute.
+        - ``silent-loopback``: loopback_peak < 0.02 — OS audio not reaching us.
+        - ``media-bleed-suspect``: mic silent but loopback significant —
+          likely user was watching a video, not in a meeting.
+        - ``low-signal``: peak_mixed < 0.05 — even mixed is quiet.
+        - ``clipping``: peak_mixed >= 0.95 — recording may be distorted.
+        - ``very-short``: duration_s < 30 — test or accidental capture.
+
+        Thresholds chosen empirically from Onda 1.6a triage of 35 real
+        captures. Order-stable to keep frontmatter diffs readable.
+        """
+        flags: list[str] = []
+        if duration_s is not None and duration_s < 30:
+            flags.append("very-short")
+        if mic_peak is not None and mic_peak < 0.02:
+            flags.append("silent-mic")
+        if loopback_peak is not None and loopback_peak < 0.02:
+            flags.append("silent-loopback")
+        if (
+            mic_peak is not None
+            and loopback_peak is not None
+            and mic_peak < 0.02
+            and loopback_peak >= 0.05
+        ):
+            flags.append("media-bleed-suspect")
+        if peak_mixed is not None and peak_mixed < 0.05:
+            flags.append("low-signal")
+        if peak_mixed is not None and peak_mixed >= 0.95:
+            flags.append("clipping")
+        return tuple(flags)
 
     def _write_md(
         self,

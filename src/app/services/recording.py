@@ -107,6 +107,12 @@ class RecordingService:
         self._silence_thread: threading.Thread | None = None
         self._silence_stop_event: threading.Event = threading.Event()
 
+        # Last reason stop() was called. Surfaced to the orchestrator via
+        # :meth:`get_last_stop_reason` so it can write it to the transcript
+        # frontmatter (Passo B). Values: "user-stopped", "silence-timeout",
+        # "app-exit". Reset to None by start().
+        self._last_stop_reason: str | None = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -142,6 +148,30 @@ class RecordingService:
             return self._recorder.get_last_device_names()  # type: ignore[attr-defined]
         except AttributeError:
             return "", ""
+
+    def get_source_peak_max(self) -> tuple[float, float]:
+        """Return ``(mic_max, loopback_max)`` running-max RMS from the last recording.
+
+        Proxies :meth:`DualAudioRecorder.get_per_source_peak_max`. Used by
+        the orchestrator to populate ``mic_peak`` and ``loopback_peak`` in
+        the transcript frontmatter (Passo B). Returns ``(0.0, 0.0)`` when
+        the recorder is None or lacks the method (back-compat).
+        """
+        if self._recorder is None:
+            return 0.0, 0.0
+        try:
+            return self._recorder.get_per_source_peak_max()  # type: ignore[attr-defined]
+        except AttributeError:
+            return 0.0, 0.0
+
+    def get_last_stop_reason(self) -> str | None:
+        """Return the reason the last ``stop()`` was called, or None.
+
+        Set by ``stop(reason=...)``; reset to None by ``start()``. Used by
+        the orchestrator to populate ``stop_reason`` in the transcript
+        frontmatter (Passo B).
+        """
+        return self._last_stop_reason
 
     def get_source_peaks(self) -> tuple[float, float]:
         """Return ``(mic_rms, loopback_rms)`` from the most-recent writer tick.
@@ -209,6 +239,7 @@ class RecordingService:
 
         self._wav_path = Path(wav_path)
         self._start_time = time.time()
+        self._last_stop_reason = None  # reset; will be set by stop()
 
         wav_path_obj = self._wav_path
         self._recorder.start(  # type: ignore[union-attr]
@@ -243,8 +274,16 @@ class RecordingService:
             except Exception as exc:
                 log.warning("[RECORDER] on_recording_started callback raised: %s", exc)
 
-    def stop(self) -> None:
+    def stop(self, *, reason: str = "user-stopped") -> None:
         """Stop recording.
+
+        Parameters
+        ----------
+        reason:
+            Why the stop was triggered. One of ``"user-stopped"`` (explicit
+            user action — default), ``"silence-timeout"`` (silence checker
+            auto-stop), or ``"app-exit"`` (shutdown). Surfaced via
+            :meth:`get_last_stop_reason` for the Passo B frontmatter.
 
         Safe to call even if not currently recording (logs a warning and returns).
         Ensures I-5: stream sink is set to None before recorder.stop().
@@ -252,6 +291,8 @@ class RecordingService:
         if not self.is_recording:
             log.warning("[RECORDER] stop() called but not recording — ignoring")
             return
+
+        self._last_stop_reason = reason
 
         wav_path = self._wav_path
         duration_s = time.time() - self._start_time
@@ -318,5 +359,5 @@ class RecordingService:
                 if self._on_silence_detected is not None:
                     self._dispatch(self._on_silence_detected)
                 else:
-                    self._dispatch(self.stop)
+                    self._dispatch(lambda: self.stop(reason="silence-timeout"))
                 break
