@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 _TEMP_DIR = Path(tempfile.gettempdir()) / "meeting_recorder"
 
 # Persistent fallback directories used when the user hasn't configured
-# vault_dir / wav_dir. Living under APPDATA means Windows won't clean
+# transcript_dir / wav_dir. Living under APPDATA means Windows won't clean
 # them out from under us (unlike %TEMP%) and the user gets a working
 # meeting archive on first run without touching Settings.
 _APPDATA_DIR = (
@@ -969,9 +969,10 @@ class Orchestrator:
             self._unregister_hotkey()
             self._register_hotkey(new_hotkey)
 
-        # Update history tab vault dir
+        # Update history tab directories (transcript_dir for reconcile,
+        # obsidian_vault_root for obsidian:// URI building — fixed in Onda 1.3)
         self._window.history_tab.update_vault_dir(  # type: ignore[attr-defined]
-            getattr(new_config, "vault_dir", None)
+            getattr(new_config, "transcript_dir", None)
         )
 
         log.info("[ORCH] Config applied")
@@ -1106,9 +1107,9 @@ class Orchestrator:
 
             # Write a new .md with _retranscribed suffix
             stem = wav_path.stem
-            vault_dir = getattr(self._config, "vault_dir", None)
-            if vault_dir is not None:
-                md_path = vault_dir / f"{stem}_retranscribed.md"
+            transcript_dir = getattr(self._config, "transcript_dir", None)
+            if transcript_dir is not None:
+                md_path = transcript_dir / f"{stem}_retranscribed.md"
             else:
                 md_path = wav_path.parent / f"{stem}_retranscribed.md"
 
@@ -1250,12 +1251,14 @@ class Orchestrator:
         return _TEMP_DIR / f"{timestamp}_meeting.wav"
 
     def _new_transcript_path(self) -> Path:
-        vault_dir = getattr(self._config, "vault_dir", None)
+        transcript_dir = getattr(self._config, "transcript_dir", None)
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{timestamp}_transcript.md"
         # Fall back to APPDATA (persistent) instead of TEMP (Windows-cleaned)
         # so transcripts survive disk-cleanup and re-launch.
-        target_dir = vault_dir if vault_dir is not None else _DEFAULT_TRANSCRIPT_DIR
+        target_dir = (
+            transcript_dir if transcript_dir is not None else _DEFAULT_TRANSCRIPT_DIR
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         return target_dir / filename
 

@@ -36,7 +36,8 @@ class TestConfigDefaults:
         """Loading from a non-existent path yields a Config with defaults."""
         cfg = load(path=_config_path(tmp_path))
 
-        assert cfg.vault_dir is None
+        assert cfg.obsidian_vault_root is None
+        assert cfg.transcript_dir is None
         assert cfg.wav_dir is None
         assert cfg.whisper_model == "Whisper-Large-v3-Turbo"
         assert cfg.silence_timeout == 120
@@ -66,7 +67,8 @@ class TestConfigRoundTrip:
         """save() then load() at the same path restores all fields."""
         path = _config_path(tmp_path)
         cfg = Config(
-            vault_dir=tmp_path / "vault",
+            obsidian_vault_root=tmp_path / "vault",
+            transcript_dir=tmp_path / "vault" / "raw" / "meetings" / "captures",
             wav_dir=tmp_path / "wav",
             whisper_model="whisper-large-v3",
             silence_timeout=45,
@@ -77,7 +79,8 @@ class TestConfigRoundTrip:
         save(cfg, path=path)
         loaded = load(path=path)
 
-        assert loaded.vault_dir == cfg.vault_dir
+        assert loaded.obsidian_vault_root == cfg.obsidian_vault_root
+        assert loaded.transcript_dir == cfg.transcript_dir
         assert loaded.wav_dir == cfg.wav_dir
         assert loaded.whisper_model == cfg.whisper_model
         assert loaded.silence_timeout == cfg.silence_timeout
@@ -88,11 +91,17 @@ class TestConfigRoundTrip:
     def test_round_trip_with_none_optionals(self, tmp_path: Path) -> None:
         """None optional fields survive a save/load cycle."""
         path = _config_path(tmp_path)
-        cfg = Config(vault_dir=None, wav_dir=None, global_hotkey=None)
+        cfg = Config(
+            obsidian_vault_root=None,
+            transcript_dir=None,
+            wav_dir=None,
+            global_hotkey=None,
+        )
         save(cfg, path=path)
         loaded = load(path=path)
 
-        assert loaded.vault_dir is None
+        assert loaded.obsidian_vault_root is None
+        assert loaded.transcript_dir is None
         assert loaded.wav_dir is None
         assert loaded.global_hotkey is None
         assert loaded.mic_device_index is None
@@ -137,6 +146,62 @@ class TestConfigRoundTrip:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         assert data["whisper_model"] == "whisper-medium.en"
         assert data["silence_timeout"] == 20
+
+
+class TestLegacyVaultDirMigration:
+    def test_legacy_vault_dir_maps_to_transcript_dir(self, tmp_path: Path) -> None:
+        """A pre-refactor config.toml using 'vault_dir' loads as transcript_dir."""
+        path = _config_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            'vault_dir = "C:/vault/raw/meetings/captures"\n'
+            'wav_dir = "C:/vault/raw/meetings/audio"\n',
+            encoding="utf-8",
+        )
+
+        cfg = load(path=path)
+
+        assert cfg.transcript_dir == Path("C:/vault/raw/meetings/captures")
+        assert cfg.wav_dir == Path("C:/vault/raw/meetings/audio")
+        # obsidian_vault_root is not derivable from legacy config
+        assert cfg.obsidian_vault_root is None
+
+    def test_transcript_dir_wins_over_legacy_when_both_present(
+        self, tmp_path: Path
+    ) -> None:
+        """If both keys exist, the new transcript_dir takes precedence."""
+        path = _config_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            'vault_dir = "C:/legacy"\n' 'transcript_dir = "C:/new"\n',
+            encoding="utf-8",
+        )
+
+        cfg = load(path=path)
+        assert cfg.transcript_dir == Path("C:/new")
+
+    def test_save_uses_transcript_dir_key_not_vault_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """save() writes 'transcript_dir', not the legacy 'vault_dir' key."""
+        import tomllib
+
+        path = _config_path(tmp_path)
+        cfg = Config(transcript_dir=tmp_path / "transcripts")
+        save(cfg, path=path)
+
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        assert "transcript_dir" in data
+        assert "vault_dir" not in data
+
+    def test_obsidian_vault_root_round_trip(self, tmp_path: Path) -> None:
+        """obsidian_vault_root field survives save/load."""
+        path = _config_path(tmp_path)
+        cfg = Config(obsidian_vault_root=tmp_path / "my-vault")
+        save(cfg, path=path)
+
+        loaded = load(path=path)
+        assert loaded.obsidian_vault_root == tmp_path / "my-vault"
 
 
 class TestLemonadeBaseUrl:

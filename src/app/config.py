@@ -88,9 +88,22 @@ class Config:
 
     All path fields are Path | None so callers must handle the None case
     (e.g. first-launch, before the user picks directories in Settings).
+
+    Path semantics:
+        obsidian_vault_root: root of the Obsidian vault (the folder that
+            contains ``.obsidian/``). Used by HistoryTab to build
+            ``obsidian://`` URIs that open files in Obsidian.
+        transcript_dir: directory where new ``.md`` transcripts are saved.
+            Typically ``<obsidian_vault_root>/raw/meetings/captures``.
+        wav_dir: directory where raw ``.wav`` recordings are saved.
+
+    The legacy field ``vault_dir`` has been split into ``obsidian_vault_root``
+    + ``transcript_dir``. ``load()`` transparently maps old
+    ``vault_dir`` TOML keys to ``transcript_dir`` for backward-compat.
     """
 
-    vault_dir: Path | None = None
+    obsidian_vault_root: Path | None = None
+    transcript_dir: Path | None = None
     wav_dir: Path | None = None
     whisper_model: str = _DEFAULT_WHISPER_MODEL
     silence_timeout: int = _DEFAULT_SILENCE_TIMEOUT
@@ -155,9 +168,27 @@ def load(path: Path | None = None) -> Config:
     except Exception as exc:
         raise ConfigError(f"Failed to parse {resolved}: {exc}") from exc
 
+    # Backward-compat migration: legacy TOML used a single ``vault_dir``
+    # key that actually stored the transcript output directory. Map it to
+    # ``transcript_dir`` if the new key isn't already set.
+    legacy_vault_dir = data.get("vault_dir")
+    transcript_dir_value = data.get("transcript_dir") or legacy_vault_dir
+    if legacy_vault_dir and not data.get("transcript_dir"):
+        log.info(
+            "[CONFIG] Migrating legacy 'vault_dir' key → 'transcript_dir' "
+            "(will be persisted on next save)"
+        )
+
     try:
         cfg = Config(
-            vault_dir=Path(data["vault_dir"]) if data.get("vault_dir") else None,
+            obsidian_vault_root=(
+                Path(data["obsidian_vault_root"])
+                if data.get("obsidian_vault_root")
+                else None
+            ),
+            transcript_dir=(
+                Path(transcript_dir_value) if transcript_dir_value else None
+            ),
             wav_dir=Path(data["wav_dir"]) if data.get("wav_dir") else None,
             whisper_model=str(data.get("whisper_model", _DEFAULT_WHISPER_MODEL)),
             silence_timeout=int(data.get("silence_timeout", _DEFAULT_SILENCE_TIMEOUT)),
@@ -199,8 +230,10 @@ def save(cfg: Config, path: Path | None = None) -> None:
         "live_captions_enabled": cfg.live_captions_enabled,
         "launch_on_login": cfg.launch_on_login,
     }
-    if cfg.vault_dir is not None:
-        data["vault_dir"] = str(cfg.vault_dir)
+    if cfg.obsidian_vault_root is not None:
+        data["obsidian_vault_root"] = str(cfg.obsidian_vault_root)
+    if cfg.transcript_dir is not None:
+        data["transcript_dir"] = str(cfg.transcript_dir)
     if cfg.wav_dir is not None:
         data["wav_dir"] = str(cfg.wav_dir)
     if cfg.global_hotkey is not None:

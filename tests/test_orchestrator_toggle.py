@@ -31,7 +31,8 @@ from app.config import Config
 
 def _make_config(tmp_path: Path) -> Config:
     return Config(
-        vault_dir=tmp_path / "vault",
+        obsidian_vault_root=tmp_path / "vault",
+        transcript_dir=tmp_path / "vault" / "raw" / "meetings" / "captures",
         wav_dir=tmp_path / "wav",
         whisper_model="whisper-medium.en",
         silence_timeout=30,
