@@ -368,3 +368,206 @@ class TestReconcile:
         assert isinstance(result.removed, list)
         assert isinstance(result.added, list)
         assert isinstance(result.entries, list)
+
+
+# ---------------------------------------------------------------------------
+# update() — ADR-8 rename support
+# ---------------------------------------------------------------------------
+
+
+class TestUpdate:
+    def test_update_replaces_entry_by_old_path(self, tmp_path: Path) -> None:
+        """update() swaps out the entry matching old_path with new_entry."""
+        idx = _index(tmp_path)
+        idx.load()
+        entry = _make_entry(tmp_path, "original")
+        idx.add(entry)
+
+        new_md = tmp_path / "renamed.md"
+        new_md.write_text("# renamed\n\nContent after rename.", encoding="utf-8")
+        new_entry = HistoryEntry(
+            path=new_md,
+            title="renamed",
+            started_at=entry.started_at,
+            duration_s=entry.duration_s,
+        )
+        idx.update(entry.path, new_entry)
+
+        idx2 = _index(tmp_path)
+        loaded = idx2.load()
+        assert len(loaded) == 1
+        assert loaded[0].path == new_md
+        assert loaded[0].title == "renamed"
+
+    def test_update_persists_to_disk(self, tmp_path: Path) -> None:
+        """update() atomically writes the change to disk."""
+        idx = _index(tmp_path)
+        idx.load()
+        entry = _make_entry(tmp_path, "before")
+        idx.add(entry)
+
+        new_md = tmp_path / "after.md"
+        new_md.write_text("# after\n\nSome content here.", encoding="utf-8")
+        new_entry = HistoryEntry(
+            path=new_md,
+            title="after",
+            started_at=entry.started_at,
+        )
+        idx.update(entry.path, new_entry)
+
+        # Reload from disk
+        idx3 = _index(tmp_path)
+        loaded = idx3.load()
+        assert loaded[0].title == "after"
+
+    def test_update_nonexistent_old_path_is_noop(self, tmp_path: Path) -> None:
+        """update() of a path not in the index does not raise."""
+        idx = _index(tmp_path)
+        idx.load()
+        ghost = tmp_path / "ghost.md"
+        new_md = tmp_path / "new.md"
+        new_md.touch()
+        new_entry = HistoryEntry(path=new_md, title="new", started_at="")
+        idx.update(ghost, new_entry)  # must not raise
+        assert idx._entries == []
+
+
+# ---------------------------------------------------------------------------
+# list_all() — ADR-5 no-cap search path
+# ---------------------------------------------------------------------------
+
+
+class TestListVsListAll:
+    def test_list_caps_at_20_by_default(self, tmp_path: Path) -> None:
+        """list() returns at most 20 entries even with 25 in the index."""
+        idx = _index(tmp_path)
+        idx.load()
+        for i in range(25):
+            md = tmp_path / f"m{i}.md"
+            md.touch()
+            idx.add(
+                HistoryEntry(
+                    path=md, title=f"m{i}", started_at=f"2026-01-01T00:00:{i:02d}+00:00"
+                )
+            )
+        assert len(idx.list()) == 20
+
+    def test_list_all_returns_every_entry(self, tmp_path: Path) -> None:
+        """list_all() returns all 25 entries (no cap)."""
+        idx = _index(tmp_path)
+        idx.load()
+        for i in range(25):
+            md = tmp_path / f"m{i}.md"
+            md.touch()
+            idx.add(
+                HistoryEntry(
+                    path=md, title=f"m{i}", started_at=f"2026-01-01T00:00:{i:02d}+00:00"
+                )
+            )
+        assert len(idx.list_all()) == 25
+
+
+# ---------------------------------------------------------------------------
+# group_by_date() — UTC→local bucketing (R6)
+# ---------------------------------------------------------------------------
+
+
+class TestGroupByDate:
+    def _entry(self, started_at: str, name: str = "m") -> HistoryEntry:
+        return HistoryEntry(
+            path=Path(f"/fake/{name}.md"),
+            title=name,
+            started_at=started_at,
+        )
+
+    def test_empty_list_returns_empty(self) -> None:
+        """group_by_date([]) returns []."""
+        result = HistoryIndex.group_by_date([])
+        assert result == []
+
+    def test_today_entry_lands_in_today_bucket(self) -> None:
+        """An entry timestamped right now ends up in 'Today'."""
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        entry = self._entry(now_iso, "today_meeting")
+
+        groups = HistoryIndex.group_by_date([entry])
+
+        headers = [h for h, _ in groups]
+        assert "Today" in headers
+        today_rows = dict(groups)["Today"]
+        assert any(e.title == "today_meeting" for e in today_rows)
+
+    def test_no_started_at_falls_into_earlier(self) -> None:
+        """An entry with no started_at falls into 'Earlier'."""
+        entry = HistoryEntry(path=Path("/fake/x.md"), title="x", started_at="")
+
+        groups = HistoryIndex.group_by_date([entry])
+
+        headers = [h for h, _ in groups]
+        assert "Earlier" in headers
+        earlier_rows = dict(groups)["Earlier"]
+        assert any(e.title == "x" for e in earlier_rows)
+
+    def test_empty_buckets_are_omitted(self) -> None:
+        """Buckets with no entries do not appear in the result."""
+        # An old entry — only 'Earlier' should appear
+        entry = self._entry("2000-01-01T00:00:00+00:00", "ancient")
+
+        groups = HistoryIndex.group_by_date([entry])
+
+        headers = [h for h, _ in groups]
+        assert "Today" not in headers
+        assert "Yesterday" not in headers
+        assert "Earlier" in headers
+
+    def test_return_type_is_list_of_tuples(self) -> None:
+        """Return value is list[tuple[str, list[HistoryEntry]]]."""
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        groups = HistoryIndex.group_by_date([self._entry(now_iso)])
+
+        assert isinstance(groups, list)
+        assert all(isinstance(g, tuple) and len(g) == 2 for g in groups)
+        header, rows = groups[0]
+        assert isinstance(header, str)
+        assert isinstance(rows, list)
+
+
+# ---------------------------------------------------------------------------
+# is_broken() — FR24 composite health check
+# ---------------------------------------------------------------------------
+
+
+class TestIsBroken:
+    def test_healthy_entry_is_not_broken(self, tmp_path: Path) -> None:
+        """A healthy .md (>= 30 non-ws chars) with no wav_path is not broken."""
+        md = tmp_path / "good.md"
+        md.write_text(
+            "# Meeting\n\nThis transcript has plenty of content to pass the check.",
+            encoding="utf-8",
+        )
+        entry = HistoryEntry(path=md, title="good", started_at="", wav_path=None)
+        assert HistoryIndex.is_broken(entry) is False
+
+    def test_md_too_short_is_broken(self, tmp_path: Path) -> None:
+        """An .md with fewer than _MIN_TRANSCRIPT_CHARS is broken (FR24c)."""
+        md = tmp_path / "short.md"
+        md.write_text("Hi", encoding="utf-8")
+        entry = HistoryEntry(path=md, title="short", started_at="", wav_path=None)
+        assert HistoryIndex.is_broken(entry) is True
+
+    def test_missing_wav_is_broken(self, tmp_path: Path) -> None:
+        """wav_path set but file gone → broken (FR24b)."""
+        md = tmp_path / "meeting.md"
+        md.write_text(
+            "# Meeting\n\nLong enough content to pass the transcript length check here.",
+            encoding="utf-8",
+        )
+        ghost_wav = tmp_path / "ghost.wav"
+        entry = HistoryEntry(path=md, title="m", started_at="", wav_path=ghost_wav)
+        assert HistoryIndex.is_broken(entry) is True
+
+    def test_missing_md_is_broken(self, tmp_path: Path) -> None:
+        """md file absent → broken (reconcile guards, but sanity-checked)."""
+        ghost_md = tmp_path / "ghost.md"
+        entry = HistoryEntry(path=ghost_md, title="ghost", started_at="", wav_path=None)
+        assert HistoryIndex.is_broken(entry) is True

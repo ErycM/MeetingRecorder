@@ -233,6 +233,12 @@ class DualAudioRecorder:
         # recording. Surfaced via get_last_peak_level() so the orchestrator
         # can detect true-silence captures and suppress the auto-rearm loop.
         self._peak_level = 0.0
+        # Per-source instantaneous RMS (current writer tick). Written by T5
+        # on every tick; read by T1 (LED poller) lock-free under CPython GIL.
+        # Names follow the _peak_level convention (see ADR-1); docstring notes
+        # these are "current-tick" not "max" values.
+        self._peak_mic: float = 0.0
+        self._peak_loop: float = 0.0
         self._last_mic_name: str = ""
         self._last_loopback_name: str = ""
 
@@ -265,6 +271,8 @@ class DualAudioRecorder:
         self._wav_path = wav_path
         self._last_audio_time = time.time()
         self._peak_level = 0.0
+        self._peak_mic = 0.0
+        self._peak_loop = 0.0
         self._level_chunks = 0
 
         # Clear queues
@@ -377,6 +385,16 @@ class DualAudioRecorder:
         """Return (mic_name, loopback_name) from the most recent start()."""
         return self._last_mic_name, self._last_loopback_name
 
+    def get_per_source_peaks(self) -> tuple[float, float]:
+        """Return (mic_rms, loopback_rms) from the most-recent writer tick.
+
+        Values are "current-tick" instantaneous RMS, not running maximums.
+        Written by T5 (writer thread) on every ~100 ms tick; read by T1
+        (LED poller at 5 Hz) lock-free under CPython's GIL (ADR-1).
+        Returns (0.0, 0.0) before the first tick or after stop().
+        """
+        return float(self._peak_mic), float(self._peak_loop)
+
     def _mic_callback(self, in_data, frame_count, time_info, status):
         import pyaudiowpatch as pyaudio
 
@@ -455,19 +473,24 @@ class DualAudioRecorder:
                 if rms > self._peak_level:
                     self._peak_level = rms
 
+                # Per-source instantaneous RMS — written every tick so the
+                # LED poller (T1, 5 Hz) always sees a fresh value within
+                # 200 ms. Lock-free: CPython GIL guarantees float assignment
+                # atomicity (ADR-1). These are current-tick values, not max.
+                mic_rms = (
+                    float(np.sqrt(np.mean(mic_chunk**2))) if len(mic_chunk) else 0.0
+                )
+                loop_rms = (
+                    float(np.sqrt(np.mean(loop_chunk**2))) if len(loop_chunk) else 0.0
+                )
+                self._peak_mic = mic_rms
+                self._peak_loop = loop_rms
+
                 # Periodic audio-level heartbeat so we can diagnose silent
                 # recordings (mic muted, BT dropout, loopback exclusive
                 # mode). Logs ~every 5s of recorded audio.
                 self._level_chunks = getattr(self, "_level_chunks", 0) + 1
                 if self._level_chunks % 50 == 0:  # 50 * 100ms = 5s
-                    mic_rms = (
-                        float(np.sqrt(np.mean(mic_chunk**2))) if len(mic_chunk) else 0.0
-                    )
-                    loop_rms = (
-                        float(np.sqrt(np.mean(loop_chunk**2)))
-                        if len(loop_chunk)
-                        else 0.0
-                    )
                     log.info(
                         "[AUDIO] level mic=%.4f loop=%.4f mixed=%.4f (>%.4f=active)",
                         mic_rms,

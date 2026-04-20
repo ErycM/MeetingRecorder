@@ -101,6 +101,33 @@ class _FakeText:
         return "1.0"
 
 
+class _FakeLEDIndicator:
+    """Minimal stub for LEDIndicator used in _make_live_tab."""
+
+    def __init__(self):
+        self.frame = _FakeCTkFrame()
+        self._active: bool | None = None
+
+    def set_active(self, active: bool) -> None:
+        self._active = active
+
+
+class _FakeStatusPill:
+    """Minimal stub for StatusPill used in _make_live_tab."""
+
+    def __init__(self):
+        self.frame = _FakeCTkFrame()
+
+    def set_state(self, state: object, subtitle: str = "") -> None:
+        pass
+
+    def set_saved(self) -> None:
+        pass
+
+    def hide(self) -> None:
+        pass
+
+
 class _FakeRoot:
     """Minimal root for after() / after_cancel() in toast tests."""
 
@@ -160,10 +187,14 @@ def _install_fake_ctk():
     fake_theme.PAD_Y = 8  # type: ignore[attr-defined]
     fake_theme.PAD_INNER = 4  # type: ignore[attr-defined]
     fake_theme.FONT_TIMER = ("Arial", 14)  # type: ignore[attr-defined]
+    fake_theme.FONT_TIMER_DEMOTED = ("Arial", 12)  # type: ignore[attr-defined]
     fake_theme.FONT_STATUS = ("Arial", 10)  # type: ignore[attr-defined]
     fake_theme.FONT_CAPTION = ("Arial", 11)  # type: ignore[attr-defined]
+    fake_theme.FONT_HEADING = ("Arial", 16, "bold")  # type: ignore[attr-defined]
+    fake_theme.FONT_LABEL = ("Arial", 10)  # type: ignore[attr-defined]
     fake_theme.FINAL_FG = "#ffffff"  # type: ignore[attr-defined]
     fake_theme.PARTIAL_FG = "#aaaaaa"  # type: ignore[attr-defined]
+    fake_theme.LED_POLL_MS = 200  # type: ignore[attr-defined]
     sys.modules["ui.theme"] = fake_theme
     # Attach theme attribute on the ui package so `from ui import theme` works
     sys.modules["ui"].theme = fake_theme  # type: ignore[attr-defined]
@@ -194,14 +225,24 @@ def _make_live_tab(root=None) -> LiveTab:
     # into a real Tk hierarchy).
     tab._on_toggle_recording = None
     tab._on_dismiss_capture_warning = None
+    tab._on_open_settings = None
     tab._root = root or _FakeRoot()
     tab._is_recording = False
+    tab._recording_svc = None
     tab._toast_after_id = None
+    tab._led_after_id = None
+    tab._led_polling = False
+    tab._captions_empty = True
     tab._action_btn = _FakeCTkButton()
     tab._toast_frame = _FakeCTkFrame()
     tab._toast_label = _FakeCTkLabel()
     tab._timer_label = _FakeCTkLabel()
     tab._status_label = _FakeCTkLabel()
+    tab._heading_label = _FakeCTkLabel()
+    tab._empty_state_label = _FakeCTkLabel()
+    tab._pill = _FakeStatusPill()
+    tab._led_mic = _FakeLEDIndicator()
+    tab._led_system = _FakeLEDIndicator()
     return tab
 
 
@@ -216,12 +257,12 @@ class TestLiveTabControls:
     @pytest.mark.parametrize(
         "state_name,expected_label,expected_enabled",
         [
-            ("IDLE", "Start Recording", True),
-            ("ARMED", "Start Recording", True),
+            ("IDLE", "Start Now", True),
+            ("ARMED", "Start Now", True),
             ("RECORDING", "Stop Recording", True),
             ("TRANSCRIBING", "Stop Recording", False),
             ("SAVING", "Stop Recording", False),
-            ("ERROR", "Start Recording", False),
+            ("ERROR", "Start Now", False),
         ],
     )
     def test_apply_app_state_sets_correct_label_and_state(

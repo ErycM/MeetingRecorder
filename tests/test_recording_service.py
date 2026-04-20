@@ -435,3 +435,59 @@ class TestSilenceTimeout:
             svc.stop()
 
         assert not silence_fired.is_set()
+
+
+# ---------------------------------------------------------------------------
+# get_source_peaks() — ADR-1 lock-free per-source RMS proxy
+# ---------------------------------------------------------------------------
+
+
+class FakeDualAudioRecorderWithPeaks(FakeDualAudioRecorder):
+    """Extended fake that supports get_per_source_peaks() (ADR-1)."""
+
+    def __init__(self):
+        super().__init__()
+        self._peak_mic: float = 0.0
+        self._peak_loop: float = 0.0
+
+    def get_per_source_peaks(self) -> tuple[float, float]:
+        return float(self._peak_mic), float(self._peak_loop)
+
+
+class TestGetSourcePeaks:
+    def test_returns_zero_when_no_recorder(self) -> None:
+        """get_source_peaks() returns (0.0, 0.0) before recording starts."""
+        from app.services.recording import RecordingService
+
+        svc = RecordingService()
+        assert svc.get_source_peaks() == (0.0, 0.0)
+
+    def test_returns_peaks_from_underlying_recorder(self, tmp_path: Path) -> None:
+        """get_source_peaks() proxies get_per_source_peaks() on the recorder."""
+        from app.services.recording import RecordingService
+
+        fake = FakeDualAudioRecorderWithPeaks()
+        fake._peak_mic = 0.05
+        fake._peak_loop = 0.03
+
+        with patch(_RECORDER_PATCH, return_value=fake):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            mic, loop = svc.get_source_peaks()
+            svc.stop()
+
+        assert abs(mic - 0.05) < 1e-9
+        assert abs(loop - 0.03) < 1e-9
+
+    def test_returns_zero_when_recorder_lacks_method(self, tmp_path: Path) -> None:
+        """Graceful fallback when DualAudioRecorder doesn't have get_per_source_peaks()."""
+        from app.services.recording import RecordingService
+
+        # Plain FakeDualAudioRecorder has no get_per_source_peaks — AttributeError path
+        with patch(_RECORDER_PATCH, return_value=FakeDualAudioRecorder()):
+            svc = RecordingService()
+            svc.start(tmp_path / "out.wav")
+            result = svc.get_source_peaks()
+            svc.stop()
+
+        assert result == (0.0, 0.0)

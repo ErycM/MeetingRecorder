@@ -100,6 +100,21 @@ class TrayService:
         # pystray MenuItem reference for the toggle item so we can update its label
         self._toggle_item: object | None = None
 
+        # ADR-3: pending toast-click callback. Set by notify(); consumed
+        # (once) by the Show-Window left-click fallback path.
+        self._pending_toast_click: Callable[[], None] | None = None
+
+        # Root-cause fix: pystray.Icon.run() registers the icon with the Windows
+        # shell asynchronously on the tray thread (T9).  If notify() is called
+        # before the shell registration completes — which happens when a mic is
+        # already active at app launch — pystray's internal notify() call reaches
+        # Shell_NotifyIconW(NIM_MODIFY) before NIM_ADD, and the OS silently drops
+        # the request.  The fix: track readiness via an Event; queue notifications
+        # that arrive before the icon is ready, then flush them inside the
+        # pystray setup callback (fired on T9 after NIM_ADD succeeds).
+        self._icon_ready: threading.Event = threading.Event()
+        self._queued_notifications: list[tuple[str, str]] = []  # (body, title)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -188,6 +203,65 @@ class TrayService:
         label = _MENU_STOP if is_recording else _MENU_START
         log.info("[TRAY] Recording state → %s (label=%r)", is_recording, label)
 
+    def notify(
+        self,
+        title: str,
+        body: str,
+        on_click: "Callable[[], None] | None" = None,
+    ) -> None:
+        """Show a Win11 toast notification (best-effort; non-blocking).
+
+        Calls ``pystray.Icon.notify(body, title)`` — pystray ≥ 0.19 on
+        Windows emits a native Shell_NotifyIconW NIF_INFO toast.  The
+        call is documented thread-safe; it returns immediately.
+
+        Parameters
+        ----------
+        title:
+            Toast title (≤60 chars recommended for Win11 — NFR6).
+        body:
+            Toast body text (≤60 chars recommended for Win11 — NFR6).
+        on_click:
+            Optional callback to invoke when the user wants to act on the
+            toast.  Because pystray's toast-click API is unreliable on
+            Win11 (ADR-3), ``on_click`` is stored as
+            ``_pending_toast_click`` and consumed by the existing
+            Show-Window tray-icon left-click fallback — so the user
+            always has a reliable path to the UI.  The callback MUST
+            already be marshalled to T1 (i.e. wrap it in dispatch before
+            passing); TrayService does NOT auto-dispatch it.
+
+        Idempotent / no-op when the icon has not been started yet.
+        """
+        if on_click is not None:
+            self._pending_toast_click = on_click
+
+        if self._icon is None:
+            log.warning(
+                "[TRAY] notify() called but icon is None (not started) — skipped"
+            )
+            return
+
+        log.info(
+            "[TRAY] notify() called: title=%r, icon_ready=%s",
+            title,
+            self._icon_ready.is_set(),
+        )
+
+        if not self._icon_ready.is_set():
+            # Icon thread is still registering with the Windows shell.
+            # Queue the notification; it will be flushed by _on_icon_setup
+            # once NIM_ADD completes (typically < 200 ms after start()).
+            log.info("[TRAY] Icon not ready yet — queuing toast: %r / %r", title, body)
+            self._queued_notifications.append((body, title))
+            return
+
+        try:
+            self._icon.notify(body, title)  # type: ignore[union-attr]
+            log.info("[TRAY] Toast sent: %r / %r", title, body)
+        except Exception as exc:
+            log.warning("[TRAY] notify() failed (non-fatal): %s", exc)
+
     # ------------------------------------------------------------------
     # Internal — icon loading
     # ------------------------------------------------------------------
@@ -239,7 +313,15 @@ class TrayService:
         """Construct the pystray.Menu with four items."""
 
         def _show_window(icon, item):
-            self._dispatch(self._on_show_window)
+            # ADR-3 fallback: if a toast-click callback is pending, invoke
+            # it once (it includes show+switch_tab) and clear it.  If no
+            # pending click, fall back to the default show-window behaviour.
+            pending = self._pending_toast_click
+            if pending is not None:
+                self._pending_toast_click = None
+                self._dispatch(pending)
+            else:
+                self._dispatch(self._on_show_window)
 
         def _toggle_record(icon, item):
             self._dispatch(self._on_toggle_record)
@@ -267,8 +349,29 @@ class TrayService:
 
     def _run_tray(self) -> None:
         """Entry point for the tray thread (T9). Blocks until icon.stop()."""
+
+        def _on_icon_setup(icon: object) -> None:
+            """Called by pystray after NIM_ADD completes — icon is now live.
+
+            This is the earliest safe moment to call icon.notify().  We set
+            the ready event first, then flush any notifications that were
+            queued before the icon thread was up.
+            """
+            self._icon_ready.set()
+            log.debug(
+                "[TRAY] Icon setup complete — flushing %d queued notification(s)",
+                len(self._queued_notifications),
+            )
+            for body, title in self._queued_notifications:
+                try:
+                    icon.notify(body, title)  # type: ignore[union-attr]
+                    log.debug("[TRAY] Flushed queued toast: %r / %r", title, body)
+                except Exception as exc:
+                    log.warning("[TRAY] Flushed notify() failed (non-fatal): %s", exc)
+            self._queued_notifications.clear()
+
         try:
-            self._icon.run()  # type: ignore[union-attr]
+            self._icon.run(setup=_on_icon_setup)  # type: ignore[union-attr]
         except Exception as exc:
             log.error("[TRAY] Tray event loop error: %s", exc)
         finally:

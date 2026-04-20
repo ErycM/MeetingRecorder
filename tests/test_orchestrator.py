@@ -465,3 +465,111 @@ class TestSilentLoopSafetyNet:
         assert orch._capture_warning_active is False
         # Mic was still active and we were ARMED → fresh recording kicked off.
         assert orch._sm.current is AppState.RECORDING
+
+
+# ---------------------------------------------------------------------------
+# FR34: quiet detection — window.show() must NOT fire on RECORDING entry
+# ---------------------------------------------------------------------------
+
+
+class TestQuietDetection:
+    def test_start_recording_does_not_call_window_show(self, tmp_path: Path) -> None:
+        """FR34: _start_recording() must NOT call window.show().
+
+        Calling show() on a hidden window breaks the 'quiet detection' UX:
+        the app would pop up a window every time a meeting starts even when
+        the user did not ask to see it.
+        """
+        cfg = _make_config(tmp_path)
+        (tmp_path / "vault").mkdir(parents=True)
+        (tmp_path / "wav").mkdir(parents=True)
+        orch, _ = _make_orchestrator(cfg)
+        orch._sm.transition(AppState.ARMED)
+
+        orch._start_recording()
+
+        orch._window.show.assert_not_called()
+
+    def test_start_recording_sends_tray_toast(self, tmp_path: Path) -> None:
+        """FR1: _start_recording() sends a tray notification (non-fatal)."""
+        cfg = _make_config(tmp_path)
+        (tmp_path / "vault").mkdir(parents=True)
+        (tmp_path / "wav").mkdir(parents=True)
+        orch, _ = _make_orchestrator(cfg)
+        orch._sm.transition(AppState.ARMED)
+
+        orch._start_recording()
+
+        orch._tray_svc.notify.assert_called_once()
+        call_kwargs = orch._tray_svc.notify.call_args
+        # First positional arg is the title
+        assert call_kwargs[0][0] == "MeetingRecorder"
+
+
+# ---------------------------------------------------------------------------
+# FR4: save toast — tray notify fires on successful save
+# ---------------------------------------------------------------------------
+
+
+class TestSaveToast:
+    def test_on_save_complete_calls_tray_notify(self, tmp_path: Path) -> None:
+        """FR4: _on_save_complete() sends a save toast via tray_svc.notify()."""
+        cfg = _make_config(tmp_path)
+        (tmp_path / "vault").mkdir(parents=True)
+        orch, _ = _make_orchestrator(cfg)
+        orch._sm.transition(AppState.ARMED)
+        orch._sm.transition(AppState.RECORDING)
+        orch._sm.transition(AppState.SAVING)
+
+        # history_index needs a writable path
+        orch._history_index._path = tmp_path / "vault" / "history.json"
+
+        md = tmp_path / "vault" / "meeting_2026-01-01.md"
+        md.write_text("# Meeting\n\nContent here.", encoding="utf-8")
+
+        orch._on_save_complete(md, None, 120.0)
+
+        orch._tray_svc.notify.assert_called()
+        # The save call uses the md file name in the body
+        call_args = orch._tray_svc.notify.call_args[0]
+        assert "meeting_2026-01-01.md" in call_args[1]
+
+    def test_on_save_complete_transitions_to_armed(self, tmp_path: Path) -> None:
+        """_on_save_complete() moves state from SAVING back to ARMED."""
+        cfg = _make_config(tmp_path)
+        (tmp_path / "vault").mkdir(parents=True)
+        orch, _ = _make_orchestrator(cfg)
+        orch._sm.transition(AppState.ARMED)
+        orch._sm.transition(AppState.RECORDING)
+        orch._sm.transition(AppState.SAVING)
+
+        orch._history_index._path = tmp_path / "vault" / "history.json"
+
+        md = tmp_path / "vault" / "meeting_test.md"
+        md.write_text("# Meeting\n\nContent here.", encoding="utf-8")
+
+        orch._on_save_complete(md, None, 60.0)
+
+        assert orch._sm.current is AppState.ARMED
+
+    def test_on_save_complete_publishes_save_result(self, tmp_path: Path) -> None:
+        """_on_save_complete() publishes a LastSaveResult so the Live tab
+        can show a toast on the SAVING→IDLE edge (ADR-3)."""
+        cfg = _make_config(tmp_path)
+        (tmp_path / "vault").mkdir(parents=True)
+        orch, _ = _make_orchestrator(cfg)
+        orch._sm.transition(AppState.ARMED)
+        orch._sm.transition(AppState.RECORDING)
+        orch._sm.transition(AppState.SAVING)
+
+        orch._history_index._path = tmp_path / "vault" / "history.json"
+
+        md = tmp_path / "vault" / "meeting_result.md"
+        md.write_text("# Meeting\n\nContent here.", encoding="utf-8")
+
+        orch._on_save_complete(md, None, 30.0)
+
+        # The result should be accessible via get_last_save_result
+        result = orch.get_last_save_result()
+        assert result is not None
+        assert result.kind == "success"

@@ -29,7 +29,7 @@ import os
 import secrets
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -45,6 +45,14 @@ def _default_history_path() -> Path:
 
 
 HISTORY_PATH: Path = _default_history_path()
+
+# ---------------------------------------------------------------------------
+# Minimum transcript chars shared between orchestrator and is_broken()
+# ---------------------------------------------------------------------------
+
+#: A transcript .md file shorter than this is considered broken / hallucinated.
+#: Mirrors ``_MIN_TRANSCRIPT_CHARS`` in orchestrator.py — single source here.
+_MIN_TRANSCRIPT_CHARS: int = 30
 
 # ---------------------------------------------------------------------------
 # Typed error
@@ -173,6 +181,25 @@ class HistoryIndex:
         else:
             log.debug("[HISTORY] remove() — path not found: %s", path.name)
 
+    def update(self, old_path: Path, new_entry: HistoryEntry) -> None:
+        """Replace the entry whose .path matches *old_path* with *new_entry*.
+
+        Persists the change atomically. No-op (logs a warning) if *old_path*
+        is not found. Used by the rename helper (ADR-8) after a successful
+        paired md/.wav rename so the index stays consistent.
+        """
+        for i, e in enumerate(self._entries):
+            if e.path == old_path:
+                self._entries[i] = new_entry
+                self._save()
+                log.debug(
+                    "[HISTORY] Updated entry: %s -> %s",
+                    old_path.name,
+                    new_entry.path.name,
+                )
+                return
+        log.warning("[HISTORY] update() — old path not found: %s", old_path.name)
+
     def list(self, limit: int = 20) -> list[HistoryEntry]:
         """Return the most-recent *limit* entries (newest first).
 
@@ -185,6 +212,110 @@ class HistoryIndex:
             reverse=True,
         )
         return sorted_entries[:limit]
+
+    def list_all(self) -> list[HistoryEntry]:
+        """Return ALL entries sorted newest first (no cap).
+
+        Used by the History tab search path — when a search query is active
+        the UI must search over the full index, not just the 20-entry window
+        (FR29, SC-11, ADR-5).
+        """
+        return sorted(
+            self._entries,
+            key=lambda e: e.started_at or "",
+            reverse=True,
+        )
+
+    @staticmethod
+    def group_by_date(
+        entries: list[HistoryEntry],
+    ) -> list[tuple[str, list[HistoryEntry]]]:
+        """Group *entries* into labelled date buckets (newest first).
+
+        Returns a list of ``(header, rows)`` tuples where *header* is one of:
+        ``"Today"``, ``"Yesterday"``, ``"This week"``, ``"Earlier"``.
+        Empty buckets are omitted entirely (FR23).
+
+        ``started_at`` is parsed via ``datetime.fromisoformat().astimezone()``
+        to convert UTC timestamps to local time before bucketing (R6 — avoids
+        UTC-boundary misclassification in non-UTC timezones). Entries with no
+        ``started_at`` fall into ``"Earlier"``.
+
+        Pure function — no I/O, no UI dependency.  Safe to call from T1 or
+        a worker thread; the result is a plain list of tuples.
+        """
+        today: date = datetime.now(tz=timezone.utc).astimezone().date()
+        yesterday: date = today - timedelta(days=1)
+        week_start: date = today - timedelta(days=today.weekday())
+
+        buckets: dict[str, list[HistoryEntry]] = {
+            "Today": [],
+            "Yesterday": [],
+            "This week": [],
+            "Earlier": [],
+        }
+
+        for entry in entries:
+            if not entry.started_at:
+                buckets["Earlier"].append(entry)
+                continue
+            try:
+                dt_local = datetime.fromisoformat(entry.started_at).astimezone()
+                entry_date = dt_local.date()
+            except (ValueError, OSError):
+                buckets["Earlier"].append(entry)
+                continue
+
+            if entry_date == today:
+                buckets["Today"].append(entry)
+            elif entry_date == yesterday:
+                buckets["Yesterday"].append(entry)
+            elif entry_date >= week_start:
+                buckets["This week"].append(entry)
+            else:
+                buckets["Earlier"].append(entry)
+
+        # Return non-empty buckets in canonical order
+        order = ["Today", "Yesterday", "This week", "Earlier"]
+        return [(label, buckets[label]) for label in order if buckets[label]]
+
+    @staticmethod
+    def is_broken(
+        entry: HistoryEntry,
+        *,
+        vault_dir: Path | None = None,
+    ) -> bool:
+        """Return True if *entry* looks broken / incomplete (FR24).
+
+        Composite rule — any of the following qualifies:
+        a) ``wav_path`` is ``None`` **and** the .md file exists on disk but
+           the entry has no associated audio (orphan md, no wav ever recorded).
+           Actually: wav_path None is only broken if we *expected* a wav —
+           for simplicity we treat wav_path=None + md exists as broken per FR24a.
+        b) ``wav_path`` is non-None but the file is missing on disk (FR24b).
+        c) The .md file exists but contains fewer than ``_MIN_TRANSCRIPT_CHARS``
+           of non-whitespace text (FR24c — Whisper hallucination / empty save).
+
+        Returns ``False`` for a healthy entry (FR24 sanity baseline).
+        """
+        # Condition (b): wav path set but file gone
+        if entry.wav_path is not None and not entry.wav_path.exists():
+            return True
+
+        # Condition (c): md too short
+        if entry.path.exists():
+            try:
+                content = entry.path.read_text(encoding="utf-8", errors="replace")
+                if len(content.strip()) < _MIN_TRANSCRIPT_CHARS:
+                    return True
+            except OSError:
+                return True
+        else:
+            # md itself is missing — reconcile would normally drop it, but
+            # if it slips through, treat as broken
+            return True
+
+        return False
 
     def reconcile(
         self,
