@@ -238,6 +238,10 @@ class Orchestrator:
         # read by AppWindow.on_state on the same edge (also T1). No locking.
         self._last_save_result: LastSaveResult | None = None
 
+        # Deferred model change: set when the user saves a new whisper_model
+        # while a recording is in progress.  Applied on the next IDLE entry.
+        self._pending_model_change: str | None = None
+
         # Load history from disk
         try:
             self._history_index.load()
@@ -1017,6 +1021,28 @@ class Orchestrator:
         if self._recording_svc:
             self._recording_svc._silence_timeout_s = float(new_config.silence_timeout)  # type: ignore[attr-defined]
 
+        # Update Whisper model (lazy reload on next recording start)
+        new_model = getattr(new_config, "whisper_model", None)
+        if (
+            self._transcription_svc is not None
+            and new_model
+            and new_model != self._transcription_svc._model
+        ):  # type: ignore[attr-defined]
+            from app.state import AppState
+
+            if self._sm.current is AppState.RECORDING:
+                log.info(
+                    "[ORCH] Model change deferred until recording stops: %s -> %s",
+                    self._transcription_svc._model,  # type: ignore[attr-defined]
+                    new_model,
+                )
+                self._pending_model_change = new_model
+            else:
+                try:
+                    self._transcription_svc.set_model(new_model)  # type: ignore[attr-defined]
+                except RuntimeError as exc:
+                    log.warning("[ORCH] set_model refused (unexpected): %s", exc)
+
         # Update hotkey registration
         new_hotkey = getattr(new_config, "global_hotkey", None)
         if new_hotkey != self._hotkey_registered:
@@ -1218,6 +1244,21 @@ class Orchestrator:
                 self._window.on_state(old, new, reason)  # type: ignore[attr-defined]
             except Exception as exc:
                 log.warning("[ORCH] AppWindow.on_state raised: %s", exc)
+
+        # Apply any pending model change when we return to IDLE
+        from app.state import AppState
+
+        if (
+            new is AppState.IDLE
+            and getattr(self, "_pending_model_change", None)
+            and self._transcription_svc is not None
+        ):
+            try:
+                self._transcription_svc.set_model(self._pending_model_change)  # type: ignore[attr-defined]
+            except RuntimeError as exc:
+                log.warning("[ORCH] Deferred set_model refused: %s", exc)
+            finally:
+                self._pending_model_change = None
 
     # ------------------------------------------------------------------
     # Timer helpers
