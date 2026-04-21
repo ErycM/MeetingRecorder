@@ -47,7 +47,9 @@ def _singleton_mutex_available() -> bool:
         import win32api
         import win32event
 
-        handle = win32event.CreateMutex(None, False, r"Local\MeetingRecorder.SingleInstance")
+        handle = win32event.CreateMutex(
+            None, False, r"Local\MeetingRecorder.SingleInstance"
+        )
         err = win32api.GetLastError()
         # Release our probe handle immediately so we don't hold it ourselves.
         if handle:

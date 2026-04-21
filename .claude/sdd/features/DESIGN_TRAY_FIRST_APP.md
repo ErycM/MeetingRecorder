@@ -8,7 +8,15 @@
 
 **Approach:** A — orchestrator gate + readiness predicate + `pystray.Icon.notify()` + Settings toggles. Locked in DEFINE §Approach; not reopened here.
 
-**Branch target:** `feat/tray-first-app` (new branch off `main`).
+**Branch target:** `feat/tray-first-app-mode` (shipped via PR [#8](https://github.com/ErycM/MeetingRecorder/pull/8)).
+
+---
+
+## Scope-change note — Round 2 (2026-04-21)
+
+DESIGN originally listed `src/app/services/tray.py` as "VERIFY (no code change)". Live SC1 verification after Round 1 shipped revealed the pystray tray icon was invisible on Windows 11 22H2+, blocking the feature's primary acceptance criterion. The fix required real edits to `tray.py` (four-step `_on_icon_setup`: `visible=True` → `NIM_SETVERSION(4)` with `uID=0` → `IsPromoted=1` registry write → `WM_SETTINGCHANGE("TrayNotify")` broadcast) plus a new test file `tests/test_tray_promote.py`.
+
+Rather than reopen DESIGN, the Round 2 rationale, root cause, and verification live in the **BUILD_REPORT** ([`BUILD_REPORT_TRAY_FIRST_APP.md` — Round 2 section](../reports/BUILD_REPORT_TRAY_FIRST_APP.md)) and durable knowledge lives in the **KB** ([`.claude/kb/windows-system-integration.md` — "Windows 11 22H2+ tray-icon visibility — three mandatory opt-ins"](../../kb/windows-system-integration.md)). Future tray work must read both before touching pystray setup.
 
 ---
 

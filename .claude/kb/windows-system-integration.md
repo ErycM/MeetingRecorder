@@ -86,6 +86,39 @@ def hide(self): self.window.withdraw()
 
 Combined with mic-based auto-show, this gives the app "never really closes" semantics. The tray's Show item calls `widget.show()` → `deiconify()`.
 
+### Windows 11 22H2+ tray-icon visibility — three mandatory opt-ins
+
+Out of the box, pystray-registered icons do NOT appear in the Windows 11 tray or its overflow flyout. Three independent gaps each make the icon invisible; all three must be closed for SC1 ("tray icon visible within 3 s") to hold. Implemented in `src/app/services/tray.py` `TrayService._on_icon_setup()`; durable knowledge recorded here because every future tray-icon change interacts with this.
+
+1. **pystray skips `NIM_ADD` when a custom `setup=` callback is passed.** `pystray._base.Icon._start_setup` only auto-sets `self.visible = True` (which internally calls `_show() → NIM_ADD`) when **no** setup callback is provided. With our custom `_on_icon_setup`, we must call `icon.visible = True` explicitly as the first line. Without it, toasts still emit (pystray's `notify()` uses `NIM_MODIFY` with `NIF_INFO`, which creates a `NotifyIconSettings` subkey as a side effect) — but there is no registered icon for Windows to draw.
+
+2. **pystray never emits `NIM_SETVERSION`, so the icon stays "legacy" and Win11 ignores `IsPromoted`.** `pystray._win32.Icon._show()` (at `site-packages/pystray/_win32.py:57-64`) only calls `Shell_NotifyIconW(NIM_ADD, …)`. The `uVersion` field of `NOTIFYICONDATAW` stays at 0. Windows 11 22H2+ treats version-0 icons as legacy and skips the whole `IsPromoted` visibility contract. The fix is to follow `NIM_ADD` with `Shell_NotifyIconW(NIM_SETVERSION, NOTIFYICONDATAW{uVersion=4})` via ctypes.
+
+   **Gotcha — pystray's `uID` is `0`, not `id(self)`.** pystray's `_message()` constructs its struct with `hID=id(self)` as a kwarg to `NOTIFYICONDATAW(...)`. The field is named **`uID`**, not `hID`, so ctypes silently drops it and the real uID stays at 0. Any direct Shell_NotifyIconW call that targets the pystray-registered icon must use `uID = 0` (not `id(icon)`) for the identity tuple to match. Easiest to verify: a `NIM_SETVERSION` call with `uID=id(icon)` returns `FALSE` and `GetLastError()==0`; with `uID=0` it returns `TRUE` and the icon appears.
+
+3. **`IsPromoted=1` must be written into `HKCU\Control Panel\NotifyIconSettings\<subkey>`.** Even with a modern (version-4) icon, Windows 11 still defaults new icons to hidden. Walk the key, match subkeys by `InitialTooltip == <our tooltip>` (a string we own and pass to `pystray.Icon`), and set `IsPromoted` (`REG_DWORD`) to `1` wherever it is missing or `0`. Matching by tooltip covers dev-mode `python.exe` / `pythonw.exe` and the frozen `MeetingRecorder.exe` all at once — each gets its own subkey because pystray's `id(self)` varies per PID, but the tooltip is stable.
+
+   After the registry write, broadcast `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "TrayNotify", SMTO_ABORTIFHUNG, 1000, …)` so Explorer invalidates its cached visibility decision and re-reads the new `IsPromoted` value on the current session — otherwise the change only takes effect on the next app launch.
+
+**Order of operations in `_on_icon_setup`:**
+```
+icon.visible = True              # 1. force NIM_ADD (pystray skipped it)
+_set_notifyicon_version_4()      # 2. NIM_SETVERSION(4) with uID=0
+_promote_in_notify_icon_settings()  # 3. IsPromoted=1 on matching subkeys
+_broadcast_tray_notify_change()  # 4. WM_SETTINGCHANGE("TrayNotify") broadcast
+# then flush queued toasts
+```
+
+Every step is Windows-gated (`sys.platform == "win32"`) and wrapped in `try/except` with `log.warning` — tray-icon visibility is best-effort; the app never crashes on a Win32 API failure.
+
+**Ruled out (do not re-litigate):**
+- Icon image problems (alpha, size). SaveLC.ico now resized to 64×64 in `_load_icon`; not the root cause of invisibility — icons with IsPromoted=0 are hidden regardless of image content.
+- `SetCurrentProcessExplicitAppUserModelID`. Affects toast identity grouping, not tray-icon promotion.
+- `explorer.exe` restart. Destructive; `WM_SETTINGCHANGE` achieves the same cache refresh non-destructively.
+- Switching pystray → `infi.systray` / direct `Shell_NotifyIcon`. All route through the same Shell API; they'd each need the same three opt-ins. Staying on pystray with surgical additions is cheaper.
+
+**Possible future work:** persistent `NIF_GUID` for the icon so the same `NotifyIconSettings` subkey is reused across launches (today a new subkey is created per-PID; our tooltip matcher cleans this up automatically, but each new subkey is orphaned once promoted). Would require a pystray monkey-patch.
+
 ---
 
 ## Windows startup registration (`install_startup.py`)

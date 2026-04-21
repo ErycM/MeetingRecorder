@@ -282,5 +282,10 @@ class TestQualityFlags:
         )
         # Expected order: very-short, silent-mic, media-bleed-suspect, low-signal
         # (silent-loopback would need loopback_peak < 0.02, not present here)
-        expected_order = ["very-short", "silent-mic", "media-bleed-suspect", "low-signal"]
+        expected_order = [
+            "very-short",
+            "silent-mic",
+            "media-bleed-suspect",
+            "low-signal",
+        ]
         assert list(flags) == expected_order

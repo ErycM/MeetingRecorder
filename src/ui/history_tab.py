@@ -123,9 +123,7 @@ def _open_path(
                     root,
                 )
             else:
-                uri = (
-                    f"obsidian://open?vault={root.name}&file={rel.as_posix()}"
-                )
+                uri = f"obsidian://open?vault={root.name}&file={rel.as_posix()}"
                 log.debug("[HISTORY] Opening via obsidian URI: %s", uri)
                 os.startfile(uri)  # type: ignore[attr-defined]
                 return
