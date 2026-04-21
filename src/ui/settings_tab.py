@@ -261,6 +261,44 @@ class SettingsTab:
         row += 1
 
         # ----------------------------------------------------------------
+        # Section: Notifications (three toggles matching [notifications] TOML)
+        # ----------------------------------------------------------------
+        _hdr("Notifications")
+
+        _lbl("Notify on recording start:")
+        self._notify_started_var = tk.BooleanVar(value=config.notify_started)
+        ctk.CTkSwitch(
+            scroll_frame,
+            text="",
+            variable=self._notify_started_var,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        _lbl("Notify on transcript saved:")
+        self._notify_saved_var = tk.BooleanVar(value=config.notify_saved)
+        ctk.CTkSwitch(
+            scroll_frame,
+            text="",
+            variable=self._notify_saved_var,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        _lbl("Notify on error:")
+        self._notify_error_var = tk.BooleanVar(value=config.notify_error)
+        ctk.CTkSwitch(
+            scroll_frame,
+            text="",
+            variable=self._notify_error_var,
+            onvalue=True,
+            offvalue=False,
+        ).grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        # ----------------------------------------------------------------
         # Section: Storage
         # ----------------------------------------------------------------
         _hdr("Storage")

@@ -122,6 +122,14 @@ class Config:
     # exposes the field and a reachability probe.
     lemonade_base_url: str = "http://localhost:13305"
 
+    # Notification toggles — [notifications] TOML table. Defaults all True
+    # so first-launch users hear every event; can be flipped off in Settings
+    # if toasts feel noisy. Backward-compat: section missing → all True
+    # (implemented in load()).
+    notify_started: bool = True
+    notify_saved: bool = True
+    notify_error: bool = True
+
     # Internal: path this config was loaded from (not serialised)
     _source_path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -144,6 +152,10 @@ class Config:
             raise ConfigError(
                 f"lemonade_base_url must start with http:// or https://, got {url!r}"
             )
+        for name in ("notify_started", "notify_saved", "notify_error"):
+            val = getattr(self, name)
+            if not isinstance(val, bool):
+                raise ConfigError(f"{name} must be bool, got {type(val).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +216,15 @@ def load(path: Path | None = None) -> Config:
             lemonade_base_url=str(
                 data.get("lemonade_base_url", "http://localhost:13305")
             ),
+            notify_started=bool(
+                (data.get("notifications") or {}).get("notify_started", True)
+            ),
+            notify_saved=bool(
+                (data.get("notifications") or {}).get("notify_saved", True)
+            ),
+            notify_error=bool(
+                (data.get("notifications") or {}).get("notify_error", True)
+            ),
             _source_path=resolved,
         )
     except ConfigError:
@@ -243,6 +264,11 @@ def save(cfg: Config, path: Path | None = None) -> None:
     if cfg.loopback_device_index is not None:
         data["loopback_device_index"] = int(cfg.loopback_device_index)
     data["lemonade_base_url"] = cfg.lemonade_base_url
+    data["notifications"] = {
+        "notify_started": cfg.notify_started,
+        "notify_saved": cfg.notify_saved,
+        "notify_error": cfg.notify_error,
+    }
 
     # Atomic write: temp file in same directory → os.replace
     rand_suffix = secrets.token_hex(4)

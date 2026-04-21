@@ -173,16 +173,14 @@ class TestLegacyVaultDirMigration:
         path = _config_path(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            'vault_dir = "C:/legacy"\n' 'transcript_dir = "C:/new"\n',
+            'vault_dir = "C:/legacy"\ntranscript_dir = "C:/new"\n',
             encoding="utf-8",
         )
 
         cfg = load(path=path)
         assert cfg.transcript_dir == Path("C:/new")
 
-    def test_save_uses_transcript_dir_key_not_vault_dir(
-        self, tmp_path: Path
-    ) -> None:
+    def test_save_uses_transcript_dir_key_not_vault_dir(self, tmp_path: Path) -> None:
         """save() writes 'transcript_dir', not the legacy 'vault_dir' key."""
         import tomllib
 
@@ -333,3 +331,87 @@ class TestAtomicWrite:
         # Last save wins
         assert loaded.whisper_model == "whisper-large-v3"
         assert loaded.silence_timeout == 19
+
+
+# ---------------------------------------------------------------------------
+# Notification toggles (TRAY_FIRST_APP — SC6 config surface)
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationsRoundTrip:
+    def test_notifications_all_true_round_trip(self, tmp_path: Path) -> None:
+        """All three toggles=True survive a save/load cycle."""
+        path = _config_path(tmp_path)
+        cfg = Config(notify_started=True, notify_saved=True, notify_error=True)
+        save(cfg, path=path)
+        loaded = load(path=path)
+
+        assert loaded.notify_started is True
+        assert loaded.notify_saved is True
+        assert loaded.notify_error is True
+
+    def test_notifications_all_false_round_trip(self, tmp_path: Path) -> None:
+        """All three toggles=False survive a save/load cycle."""
+        path = _config_path(tmp_path)
+        cfg = Config(notify_started=False, notify_saved=False, notify_error=False)
+        save(cfg, path=path)
+        loaded = load(path=path)
+
+        assert loaded.notify_started is False
+        assert loaded.notify_saved is False
+        assert loaded.notify_error is False
+
+    def test_notifications_mixed_round_trip(self, tmp_path: Path) -> None:
+        """Mixed toggles (False/True/True) preserve individual values."""
+        path = _config_path(tmp_path)
+        cfg = Config(notify_started=False, notify_saved=True, notify_error=True)
+        save(cfg, path=path)
+        loaded = load(path=path)
+
+        assert loaded.notify_started is False
+        assert loaded.notify_saved is True
+        assert loaded.notify_error is True
+
+    def test_notifications_section_header_emitted(self, tmp_path: Path) -> None:
+        """save() renders [notifications] as a nested table (ADR-8)."""
+        path = _config_path(tmp_path)
+        cfg = Config(notify_started=True, notify_saved=True, notify_error=True)
+        save(cfg, path=path)
+
+        content = path.read_text(encoding="utf-8")
+        assert "[notifications]" in content
+
+    def test_notifications_defaults_when_section_missing(self, tmp_path: Path) -> None:
+        """Loading a TOML file with no [notifications] section → all three True."""
+        path = _config_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            'whisper_model = "Whisper-Large-v3-Turbo"\n'
+            "silence_timeout = 120\n"
+            "live_captions_enabled = true\n"
+            "launch_on_login = false\n"
+            'lemonade_base_url = "http://localhost:13305"\n',
+            encoding="utf-8",
+        )
+        loaded = load(path=path)
+
+        assert loaded.notify_started is True
+        assert loaded.notify_saved is True
+        assert loaded.notify_error is True
+
+
+class TestNotificationsValidation:
+    def test_notify_started_rejects_non_bool(self) -> None:
+        """notify_started with a non-bool raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(notify_started="yes")  # type: ignore[arg-type]
+
+    def test_notify_saved_rejects_non_bool(self) -> None:
+        """notify_saved with a non-bool raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(notify_saved=1)  # type: ignore[arg-type]
+
+    def test_notify_error_rejects_non_bool(self) -> None:
+        """notify_error with a non-bool raises ConfigError."""
+        with pytest.raises(ConfigError):
+            Config(notify_error="false")  # type: ignore[arg-type]
