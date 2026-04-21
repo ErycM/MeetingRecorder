@@ -138,6 +138,12 @@ class AppWindow:
         tabview.configure(command=lambda: self._on_tab_change(tabview))
 
         self._tabview = tabview
+
+        # ADR-4: tray-first boot — always start withdrawn so the root is alive
+        # for after() dispatch but no window is visible. show() calls deiconify()
+        # when the user or the readiness gate needs the window.
+        self._root.withdraw()
+
         log.debug("[APP_WINDOW] Window constructed")
 
     # ------------------------------------------------------------------

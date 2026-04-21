@@ -356,8 +356,20 @@ class Orchestrator:
             daemon=True,
         ).start()
 
-        # Show window
-        self._window.show()  # type: ignore[attr-defined]
+        # Tray-first boot: open the window ONLY if the readiness predicate fails.
+        # When it passes (the common case), the CTk root stays withdrawn and the
+        # user only sees the tray icon — DEFINE G1/G2/SC1/SC2.
+        from app.readiness import is_ready as _is_ready
+
+        ok, reason = _is_ready(self._config)
+        if not ok:
+            log.info("[ORCH] Readiness failed — opening Settings: %s", reason)
+            self._window.show()  # type: ignore[attr-defined]
+            self._window.switch_tab("Settings")  # type: ignore[attr-defined]
+        else:
+            log.info("[ORCH] Readiness OK — staying in tray")
+        # NOTE: self._window.run() below enters mainloop even when root is
+        # withdrawn (ADR-4). Do NOT move it.
 
         # Enter Tk mainloop (blocks)
         log.info("[ORCH] Entering Tk mainloop")
@@ -443,6 +455,9 @@ class Orchestrator:
 
         self._window.settings_tab.set_npu_status(False, error)  # type: ignore[attr-defined]
         log.error("[ORCH] NPU not ready: %s", error)
+
+        # SC5: error toast — NPU not ready at startup
+        self._notify_if_enabled("error", _TOAST_TITLE, f"NPU not ready: {error[:40]}")
 
         if self._sm.current is AppState.IDLE:
             self._sm.transition(AppState.ERROR, reason=ErrorReason.LEMONADE_UNREACHABLE)
@@ -543,17 +558,15 @@ class Orchestrator:
         self._tray_svc.set_recording_state(True)  # type: ignore[attr-defined]
         self._start_timer()
 
-        # FR1-FR3: tray toast — best-effort, non-blocking (TI-3).
+        # FR1-FR3 → _notify_if_enabled gated on config.notify_started (SC3, SC6).
         # on_click is an already-marshalled closure; TrayService stores it
         # for the left-click fallback path (ADR-3, TI-4).
-        try:
-            self._tray_svc.notify(  # type: ignore[attr-defined]
-                _TOAST_TITLE,
-                _TOAST_BODY_RECORDING,
-                on_click=self._on_toast_clicked,
-            )
-        except Exception as exc:
-            log.warning("[ORCH] tray.notify(recording) failed (non-fatal): %s", exc)
+        self._notify_if_enabled(
+            "started",
+            _TOAST_TITLE,
+            _TOAST_BODY_RECORDING,
+            on_click=self._on_toast_clicked,
+        )
 
     def _on_toast_clicked(self) -> None:
         """Invoked when the user activates the recording-started toast.
@@ -572,6 +585,37 @@ class Orchestrator:
             )
         except Exception as exc:
             log.warning("[ORCH] _on_toast_clicked dispatch failed: %s", exc)
+
+    def _notify_if_enabled(
+        self,
+        category: str,
+        title: str,
+        body: str,
+        *,
+        on_click: object = None,
+    ) -> None:
+        """Emit a tray toast iff the matching Config toggle is True.
+
+        Always emits an INFO log regardless of the toggle (SC6).
+        ``category`` must be one of: ``"started"``, ``"saved"``, ``"error"``.
+
+        Must be called from T1 (the Tk mainloop). Body is truncated to
+        60 characters to match NFR6; title is used as-is (already short).
+        """
+        body_trimmed = body[:60] if body else body
+        log.info("[ORCH] notify.%s: %s", category, body_trimmed)
+
+        attr = f"notify_{category}"
+        enabled = bool(getattr(self._config, attr, True))
+        if not enabled:
+            return
+
+        try:
+            self._tray_svc.notify(  # type: ignore[attr-defined]
+                title, body_trimmed, on_click=on_click
+            )
+        except Exception as exc:
+            log.warning("[ORCH] tray.notify(%s) failed (non-fatal): %s", category, exc)
 
     def _stop_recording(self) -> None:
         """Transition RECORDING → SAVING, stop all recording/streaming."""
@@ -731,6 +775,12 @@ class Orchestrator:
                     ToastKind.ERROR, f"Transcription failed: {r}"
                 )
             )
+            # SC5: error toast — additive to the in-window banner
+            self._window.dispatch(  # type: ignore[attr-defined]
+                lambda r=reason: self._notify_if_enabled(
+                    "error", _TOAST_TITLE, f"Transcription failed: {r}"
+                )
+            )
             self._window.dispatch(self._transition_to_armed)  # type: ignore[attr-defined]
 
     def _on_save_complete(
@@ -770,14 +820,13 @@ class Orchestrator:
         self._publish_save_result(
             ToastKind.SUCCESS, f"Recording saved \u2192 {md_path.name}"
         )
-        # FR4: tray save-toast — SUCCESS only; NEUTRAL/ERROR are silent.
-        try:
-            self._tray_svc.notify(  # type: ignore[attr-defined]
-                _TOAST_TITLE,
-                _TOAST_BODY_SAVED.format(name=md_path.name),
-            )
-        except Exception as exc:
-            log.warning("[ORCH] tray.notify(saved) failed (non-fatal): %s", exc)
+        # FR4 → _notify_if_enabled gated on config.notify_saved (SC4, SC6).
+        # md_path.name is basename-only — Critical Rule #5 already honoured.
+        self._notify_if_enabled(
+            "saved",
+            _TOAST_TITLE,
+            _TOAST_BODY_SAVED.format(name=md_path.name),
+        )
         # Clean capture — reset the safety-net counter and clear any banner
         # the user may have left up from a previous misconfiguration.
         self._consecutive_silent_filtered = 0
@@ -827,6 +876,10 @@ class Orchestrator:
                     self._consecutive_silent_filtered,
                 )
                 self._capture_warning_active = True
+                # SC5: error toast — silent-capture safety-net tripped
+                self._notify_if_enabled(
+                    "error", _TOAST_TITLE, "Capture issue — check audio settings"
+                )
                 try:
                     mic_name, loop_name = self._recording_svc.get_last_device_names()  # type: ignore[attr-defined]
                 except Exception:
@@ -1147,6 +1200,10 @@ class Orchestrator:
         from app.state import AppState, ErrorReason
 
         log.error("[ORCH] Service error: %s", exc)
+        # SC5: error toast — service-level error
+        self._notify_if_enabled(
+            "error", _TOAST_TITLE, f"Service error: {str(exc)[:40]}"
+        )
         if self._sm.current is not AppState.ERROR:
             self._sm.transition(AppState.ERROR, reason=ErrorReason.LEMONADE_UNREACHABLE)
 

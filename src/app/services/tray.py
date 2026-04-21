@@ -52,6 +52,12 @@ _MENU_START = "Start Recording"
 _MENU_STOP = "Stop Recording"
 _MENU_QUIT = "Quit"
 
+# Tray-icon name + tooltip passed to pystray. Also used as the key for
+# matching our own entries in HKCU\Control Panel\NotifyIconSettings so
+# Windows 11 shows the icon (see _NotifyIconPromoter).
+_TRAY_TOOLTIP = "MeetingRecorder"
+_NOTIFY_ICON_SETTINGS_KEY = r"Control Panel\NotifyIconSettings"
+
 
 # ---------------------------------------------------------------------------
 # TrayService
@@ -134,9 +140,9 @@ class TrayService:
         menu = self._build_menu(pystray)
 
         self._icon = pystray.Icon(
-            "MeetingRecorder",
+            _TRAY_TOOLTIP,
             image,
-            "MeetingRecorder",
+            _TRAY_TOOLTIP,
             menu=menu,
         )
 
@@ -267,12 +273,21 @@ class TrayService:
     # ------------------------------------------------------------------
 
     def _load_icon(self, path: Path) -> object:
-        """Load an icon from *path*, falling back to a simple PIL image."""
+        """Load an icon from *path*, falling back to a simple PIL image.
+
+        Windows 11's tray silently drops oversized icons — SaveLC.ico ships
+        as a single 256×256 frame, which Shell_NotifyIconW registers but
+        doesn't render. Resize to 64×64 (pystray's conventional tray size;
+        Windows downscales to 16×16 / 24×24 / 32×32 as needed per DPI).
+        """
         from PIL import Image
 
         if path.exists():
             try:
-                return Image.open(path)
+                img = Image.open(path)
+                if img.size != (64, 64):
+                    img = img.convert("RGBA").resize((64, 64), Image.LANCZOS)
+                return img
             except Exception as exc:
                 log.warning("[TRAY] Could not load icon %s: %s", path.name, exc)
 
@@ -353,11 +368,31 @@ class TrayService:
         def _on_icon_setup(icon: object) -> None:
             """Called by pystray after NIM_ADD completes — icon is now live.
 
-            This is the earliest safe moment to call icon.notify().  We set
-            the ready event first, then flush any notifications that were
-            queued before the icon thread was up.
+            Order of operations (each step is independent + guarded):
+              1. ``_icon_ready`` event — unblocks any thread waiting on setup.
+              2. Force ``NIM_ADD`` via ``visible=True`` (pystray's default
+                 setup auto-visibles, but when we pass a custom setup
+                 callback the ``_base.Icon._start_setup`` path skips it).
+              3. Opt into the modern NotifyIcon contract
+                 (``NIM_SETVERSION(NOTIFYICON_VERSION_4)``) so Windows 11
+                 honours ``IsPromoted=1``.
+              4. Write ``IsPromoted=1`` on matching registry subkeys.
+              5. Broadcast ``WM_SETTINGCHANGE("TrayNotify")`` so Explorer
+                 re-reads its visibility cache.
+              6. Flush queued toast notifications.
             """
             self._icon_ready.set()
+
+            try:
+                icon.visible = True  # type: ignore[attr-defined]
+                log.info("[TRAY] NIM_ADD forced via visible=True")
+            except Exception as exc:
+                log.warning("[TRAY] Forcing visible=True failed (non-fatal): %s", exc)
+
+            self._set_notifyicon_version_4()
+            self._promote_in_notify_icon_settings()
+            self._broadcast_tray_notify_change()
+
             log.debug(
                 "[TRAY] Icon setup complete — flushing %d queued notification(s)",
                 len(self._queued_notifications),
@@ -377,3 +412,247 @@ class TrayService:
         finally:
             self._running = False
             log.debug("[TRAY] Tray event loop exited")
+
+    # ------------------------------------------------------------------
+    # Internal — Windows 11 tray-icon promotion
+    # ------------------------------------------------------------------
+
+    def _promote_in_notify_icon_settings(self) -> None:
+        """Set IsPromoted=1 on NotifyIconSettings entries matching our tooltip.
+
+        Windows 11 22H2+ hides new tray icons by default: pystray's NIM_ADD
+        creates an entry under HKCU\\Control Panel\\NotifyIconSettings\\<id>
+        with IsPromoted absent or 0, which Windows treats as "don't show".
+        pystray does not touch this key.  We match by InitialTooltip (a
+        value we own) and set IsPromoted to 1 (REG_DWORD).  Idempotent;
+        failures are logged but never raised.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return
+        try:
+            import winreg  # type: ignore[import-not-found]
+        except ImportError:
+            return
+        promoted, already = _NotifyIconPromoter(winreg, _TRAY_TOOLTIP).promote()
+        if promoted:
+            log.info(
+                "[TRAY] Promoted %d NotifyIconSettings entr%s (IsPromoted=1): %s",
+                len(promoted),
+                "y" if len(promoted) == 1 else "ies",
+                promoted,
+            )
+        elif already:
+            log.debug(
+                "[TRAY] NotifyIconSettings: %d matching entr%s already promoted",
+                len(already),
+                "y" if len(already) == 1 else "ies",
+            )
+        else:
+            log.debug("[TRAY] NotifyIconSettings: no matching entries found")
+
+    # ------------------------------------------------------------------
+    # Internal — Windows 11 modern-contract + cache-nudge helpers
+    # ------------------------------------------------------------------
+
+    def _set_notifyicon_version_4(self) -> None:
+        """Opt into the modern NotifyIcon contract so IsPromoted is honoured.
+
+        pystray's ``_win32.Icon._show()`` only issues ``NIM_ADD`` and never
+        follows with ``NIM_SETVERSION``.  Under Windows 11 22H2+, icons
+        whose ``uVersion`` remains 0 are treated as legacy and skip the
+        ``IsPromoted`` visibility policy entirely.  This method emits the
+        missing ``NIM_SETVERSION(NOTIFYICON_VERSION_4)`` directly against
+        ``Shell_NotifyIconW``, reusing pystray's internal ``_hwnd`` and
+        ``id(icon)`` tuple so Windows recognises the same icon.
+
+        Safe on any platform: Windows-gated and fully try/except-wrapped.
+        Never raises.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return
+        if self._icon is None:
+            return
+
+        hwnd = getattr(self._icon, "_hwnd", None)
+        if not hwnd:
+            log.warning("[TRAY] NIM_SETVERSION skipped: pystray._hwnd unavailable")
+            return
+
+        try:
+            import ctypes
+
+            from pystray._util import win32 as _psw32
+        except Exception as exc:
+            log.warning("[TRAY] NIM_SETVERSION skipped: import failed (%s)", exc)
+            return
+
+        NOTIFYICON_VERSION_4 = 4
+        # pystray's _message() passes ``hID=id(self)`` as a kwarg to the
+        # NOTIFYICONDATAW struct, but the field is named ``uID`` — so
+        # ctypes silently drops it and pystray's actual uID is 0.  We
+        # must use uID=0 here for the identity tuple to match the
+        # NIM_ADD-registered icon.
+        try:
+            nid = _psw32.NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_psw32.NOTIFYICONDATAW)
+            nid.hWnd = hwnd
+            nid.uID = 0
+            nid.uFlags = 0
+            nid.uVersion = NOTIFYICON_VERSION_4  # anonymous union slot
+            result = _psw32.Shell_NotifyIcon(_psw32.NIM_SETVERSION, ctypes.byref(nid))
+            if result:
+                log.info("[TRAY] NIM_SETVERSION(4) succeeded")
+            else:
+                log.warning(
+                    "[TRAY] NIM_SETVERSION(4) returned FALSE (GetLastError=%d)",
+                    ctypes.get_last_error(),
+                )
+        except Exception as exc:
+            log.warning("[TRAY] NIM_SETVERSION(4) raised: %s", exc)
+
+    def _broadcast_tray_notify_change(self) -> None:
+        """Nudge Explorer to refresh its cached NotifyIcon visibility decision.
+
+        After we write ``IsPromoted=1`` into
+        ``HKCU\\Control Panel\\NotifyIconSettings\\<subkey>``, Explorer's
+        in-memory TrayNotify cache still reflects the pre-write value
+        until something tells it to reload.  A broadcast of
+        ``WM_SETTINGCHANGE`` with ``lParam="TrayNotify"`` is the
+        documented, non-destructive nudge (explorer.exe restart would be
+        the heavyweight alternative).
+
+        Safe on any platform: Windows-gated and fully try/except-wrapped.
+        Never raises.
+        """
+        import sys
+
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+        except Exception as exc:
+            log.warning(
+                "[TRAY] WM_SETTINGCHANGE skipped: ctypes import failed (%s)", exc
+            )
+            return
+
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        try:
+            result = ctypes.c_long()
+            ret = ctypes.windll.user32.SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                ctypes.c_wchar_p("TrayNotify"),
+                SMTO_ABORTIFHUNG,
+                1000,
+                ctypes.byref(result),
+            )
+            if ret:
+                log.info("[TRAY] WM_SETTINGCHANGE('TrayNotify') broadcast sent")
+            else:
+                log.debug(
+                    "[TRAY] WM_SETTINGCHANGE broadcast returned 0 (GetLastError=%d)",
+                    ctypes.get_last_error(),
+                )
+        except Exception as exc:
+            log.warning("[TRAY] WM_SETTINGCHANGE broadcast raised: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Helper — NotifyIconSettings promoter (separate class so it can be unit-tested
+# with a fake winreg on any platform).
+# ---------------------------------------------------------------------------
+
+
+class _NotifyIconPromoter:
+    """Walks HKCU NotifyIconSettings and writes IsPromoted=1 for matching entries.
+
+    Abstracted around a *winreg-like* module (the real ``winreg`` at runtime,
+    a fake in tests).  Public method :meth:`promote` returns two lists of
+    subkey names: ``(newly_promoted, already_promoted)`` — for logging.
+    """
+
+    def __init__(self, winreg_mod: object, tooltip: str) -> None:
+        self._w = winreg_mod
+        self._tooltip = tooltip
+
+    def promote(self) -> tuple[list[str], list[str]]:
+        w = self._w
+        promoted: list[str] = []
+        already: list[str] = []
+        try:
+            with w.OpenKey(  # type: ignore[attr-defined]
+                w.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
+                _NOTIFY_ICON_SETTINGS_KEY,
+                0,
+                w.KEY_READ,  # type: ignore[attr-defined]
+            ) as root:
+                for name in self._enum_subkeys(root):
+                    self._check_and_promote(name, promoted, already)
+        except FileNotFoundError:
+            log.debug("[TRAY] NotifyIconSettings path missing — nothing to promote")
+        except OSError as exc:
+            log.warning("[TRAY] NotifyIconSettings walk failed: %s", exc)
+        return promoted, already
+
+    def _enum_subkeys(self, root_handle: object):
+        w = self._w
+        i = 0
+        while True:
+            try:
+                yield w.EnumKey(root_handle, i)  # type: ignore[attr-defined]
+            except OSError:
+                return
+            i += 1
+
+    def _check_and_promote(
+        self,
+        subkey_name: str,
+        promoted: list[str],
+        already: list[str],
+    ) -> None:
+        w = self._w
+        path = f"{_NOTIFY_ICON_SETTINGS_KEY}\\{subkey_name}"
+        try:
+            with w.OpenKey(  # type: ignore[attr-defined]
+                w.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
+                path,
+                0,
+                w.KEY_READ,  # type: ignore[attr-defined]
+            ) as sub:
+                try:
+                    tooltip, _tip_type = w.QueryValueEx(sub, "InitialTooltip")  # type: ignore[attr-defined]
+                except OSError:
+                    return
+                if tooltip != self._tooltip:
+                    return
+                try:
+                    current, _cur_type = w.QueryValueEx(sub, "IsPromoted")  # type: ignore[attr-defined]
+                except OSError:
+                    current = None
+            if current == 1:
+                already.append(subkey_name)
+                return
+            with w.OpenKey(  # type: ignore[attr-defined]
+                w.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
+                path,
+                0,
+                w.KEY_SET_VALUE,  # type: ignore[attr-defined]
+            ) as writable:
+                w.SetValueEx(  # type: ignore[attr-defined]
+                    writable,
+                    "IsPromoted",
+                    0,
+                    w.REG_DWORD,  # type: ignore[attr-defined]
+                    1,
+                )
+            promoted.append(subkey_name)
+        except OSError as exc:
+            log.debug("[TRAY] Could not promote %s: %s", subkey_name, exc)
