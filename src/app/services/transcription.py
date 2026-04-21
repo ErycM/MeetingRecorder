@@ -298,6 +298,37 @@ class TranscriptionService:
         self._endpoint = server_url.rstrip("/")
         self._ready = False  # force re-ensure_ready after URL change
 
+    def set_model(self, new_model: str) -> None:
+        """Update the Whisper model for the next ensure_ready() call.
+
+        Pure attribute mutation — no blocking I/O, safe to call from T1.
+        The model reload happens lazily the next time ensure_ready() runs
+        (off-T1, at recording start).
+
+        Parameters
+        ----------
+        new_model:
+            Whisper model name (e.g. ``"Whisper-Large-v3-Turbo"``).
+
+        Raises
+        ------
+        RuntimeError
+            If called while a streaming session is active.  Stop the
+            recording first so the in-flight WebSocket session is not
+            silently left with the old model binding.
+        """
+        if new_model == self._model:
+            return  # silent no-op
+
+        if self._stream_running:
+            raise RuntimeError("Cannot change model mid-stream; stop recording first")
+
+        old = self._model
+        self._model = new_model
+        self._model_loaded = False
+        self._ready = False
+        log.info("[TRANSCRIBE] Model changed: %s -> %s", old, new_model)
+
     # ------------------------------------------------------------------
     # Public API — batch transcription
     # ------------------------------------------------------------------

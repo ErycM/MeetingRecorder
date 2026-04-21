@@ -63,9 +63,7 @@ class TestFindVaultRoot:
         found = _find_vault_root(vault_tree["md_file"])
         assert found == vault_tree["root"]
 
-    def test_finds_vault_when_start_is_the_root_itself(
-        self, vault_tree: dict
-    ) -> None:
+    def test_finds_vault_when_start_is_the_root_itself(self, vault_tree: dict) -> None:
         """Calling with the vault root returns the root."""
         found = _find_vault_root(vault_tree["root"])
         assert found == vault_tree["root"]

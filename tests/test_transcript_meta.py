@@ -74,7 +74,7 @@ class TestRenderFrontmatter:
     def test_device_names_with_special_chars_are_quoted(self) -> None:
         """Device names with ``:`` or ``"`` are safely quoted."""
         meta = TranscriptMetadata(
-            mic_device='Headset (AirPods Pro): Mic',  # colon + parens
+            mic_device="Headset (AirPods Pro): Mic",  # colon + parens
         )
         out = render_frontmatter(meta)
 
@@ -97,7 +97,6 @@ class TestRenderFrontmatter:
 
     def test_frontmatter_is_valid_yaml(self) -> None:
         """Round-trip through a minimal YAML parser."""
-        import tomllib  # stdlib — no pyyaml dependency
 
         meta = TranscriptMetadata(
             saved_at=datetime(2026, 4, 19, 19, 53, 17),
